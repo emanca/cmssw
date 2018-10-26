@@ -24,11 +24,11 @@ particleLevel = cms.EDProducer("ParticleLevelProducer",
     excludeNeutrinosFromJetClustering = cms.bool(True),
     
     particleMinPt  = cms.double(0.),
-    particleMaxEta = cms.double(5.), # HF range. Maximum 6.0 on MiniAOD
+    particleMaxEta = cms.double(6.), # HF range. Maximum 6.0 on MiniAOD
     
-    lepConeSize = cms.double(0.1), # for photon dressing
-    lepMinPt    = cms.double(15.),
-    lepMaxEta   = cms.double(2.5),
+    lepConeSize = cms.double(0.), # for photon dressing
+    lepMinPt    = cms.double(0.),
+    lepMaxEta   = cms.double(10.),
     
     jetConeSize = cms.double(0.4),
     jetMinPt    = cms.double(10.),

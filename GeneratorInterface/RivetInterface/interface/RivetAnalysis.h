@@ -34,6 +34,7 @@ namespace Rivet {
       bool _usePromptFinalStates;
       bool _excludePromptLeptonsFromJetClustering;
       bool _excludeNeutrinosFromJetClustering;
+      bool _getMuonsFromTauDecays;
       
       double _particleMinPt, _particleMaxEta;
       double _lepConeSize, _lepMinPt, _lepMaxEta;
@@ -50,6 +51,7 @@ namespace Rivet {
       _usePromptFinalStates(pset.getParameter<bool>("usePromptFinalStates")),
       _excludePromptLeptonsFromJetClustering(pset.getParameter<bool>("excludePromptLeptonsFromJetClustering")),
       _excludeNeutrinosFromJetClustering(pset.getParameter<bool>("excludeNeutrinosFromJetClustering")),
+      _getMuonsFromTauDecays(pset.getParameter<bool>("getMuonsFromTauDecays")),
 
       _particleMinPt  (pset.getParameter<double>("particleMinPt")),
       _particleMaxEta (pset.getParameter<double>("particleMaxEta")),
@@ -65,6 +67,7 @@ namespace Rivet {
       _fatJetConeSize (pset.getParameter<double>("fatJetConeSize")),
       _fatJetMinPt    (pset.getParameter<double>("fatJetMinPt")),
       _fatJetMaxEta   (pset.getParameter<double>("fatJetMaxEta"))
+
       {
       }
 
@@ -84,7 +87,7 @@ namespace Rivet {
         
         PromptFinalState prompt_leptons(charged_leptons);
         prompt_leptons.acceptMuonDecays(true);
-        prompt_leptons.acceptTauDecays(true);
+        prompt_leptons.acceptTauDecays(_getMuonsFromTauDecays);
         
         PromptFinalState prompt_photons(photons);
         prompt_photons.acceptMuonDecays(true);

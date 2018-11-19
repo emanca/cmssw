@@ -27,7 +27,7 @@ particleLevel = cms.EDProducer("ParticleLevelProducer",
     particleMinPt  = cms.double(0.),
     particleMaxEta = cms.double(100.), # HF range. Maximum 6.0 on MiniAOD
     
-    lepConeSize = cms.double(0.), # for photon dressing
+    lepConeSize = cms.double(0.1), # for photon dressing
     lepMinPt    = cms.double(0.),
     lepMaxEta   = cms.double(100.),
     

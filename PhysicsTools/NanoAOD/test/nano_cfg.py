@@ -1,6 +1,6 @@
 import FWCore.ParameterSet.Config as cms
 from Configuration.StandardSequences.Eras import eras
-process = cms.Process('NANO',eras.Run2_2017,eras.run2_nanoAOD_92X)
+process = cms.Process('NANO',eras.Run2_2016,eras.run2_miniAOD_80XLegacy)
 
 process.load("FWCore.MessageLogger.MessageLogger_cfi")
 
@@ -8,7 +8,7 @@ process.load("Configuration.StandardSequences.GeometryDB_cff")
 process.load("Configuration.StandardSequences.FrontierConditions_GlobalTag_cff")
 process.load('Configuration.StandardSequences.Services_cff')
 from Configuration.AlCa.autoCond import autoCond
-process.GlobalTag.globaltag = autoCond['phase1_2017_realistic']
+process.GlobalTag.globaltag = autoCond['run2_mc']
 
 process.options   = cms.untracked.PSet( wantSummary = cms.untracked.bool(True) )
 process.MessageLogger.cerr.FwkReport.reportEvery = 100
@@ -36,6 +36,7 @@ process.nanoPath = cms.Path(process.nanoSequenceMC)
 process.out = cms.OutputModule("NanoAODOutputModule",
     fileName = cms.untracked.string('nano.root'),
     outputCommands = process.NanoAODEDMEventContent.outputCommands,
+    fakeNameForCrab =cms.untracked.bool(True),
    #compressionLevel = cms.untracked.int32(9),
     #compressionAlgorithm = cms.untracked.string("LZMA"),
 
@@ -47,4 +48,4 @@ process.out1 = cms.OutputModule("NanoAODOutputModule",
     compressionAlgorithm = cms.untracked.string("LZMA"),
 
 )
-process.end = cms.EndPath(process.out+process.out1)  
+process.end = cms.EndPath(process.out)  

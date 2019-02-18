@@ -25,13 +25,13 @@ config.General.transferOutputs = True
 config.General.transferLogs = True
 
 config.JobType.pluginName = 'Analysis'
-config.JobType.psetName = 'nano_cfg.py'
+config.JobType.psetName = 'myNanoProdMc_NANO.py'
 
 config.Data.inputDataset = '{dataset}'
 config.Data.inputDBS = 'global'
 config.Data.splitting = 'FileBased'
 config.Data.unitsPerJob = 5
-config.Data.outLFNDirBase = '/store/user/%s/NanoWMass/' % (getUsernameFromSiteDB())
+config.Data.outLFNDirBase = '/store/user/%s/NanoWMassV4/' % (getUsernameFromSiteDB())
 config.Data.publication = True
 config.Data.outputDatasetTag = 'NanoWMass'
 

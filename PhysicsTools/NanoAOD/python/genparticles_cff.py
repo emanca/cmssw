@@ -38,9 +38,9 @@ genParticleTable = cms.EDProducer("SimpleCandidateFlatTableProducer",
     singleton = cms.bool(False), # the number of entries is variable
     extension = cms.bool(False), # this is the main table for the taus
     variables = cms.PSet(
-         pt  = Var("pt",  float,precision=8),
-         phi = Var("phi", float,precision=8),
-         eta  = Var("eta",  float,precision=8),
+         pt  = Var("pt",  float),
+         phi = Var("phi", float),
+         eta  = Var("eta",  float),
          mass = Var("?mass>10 || (pdgId==22 && mass > 1) || abs(pdgId)==24 || pdgId==23?mass:0", float,precision=8,doc="Mass stored for all particles with mass > 10 GeV and photons with mass > 1 GeV. For other particles you can lookup from PDGID"),
          pdgId  = Var("pdgId", int, doc="PDG id"),
          status  = Var("status", int, doc="Particle status. 1=stable"),

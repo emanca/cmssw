@@ -61,8 +61,7 @@ class SimpleFlatTableProducerBase : public edm::stream::EDProducer<> {
             public:
                 VariableBase(const std::string & aname, nanoaod::FlatTable::ColumnType atype, const edm::ParameterSet & cfg) : 
                 name_(aname), doc_(cfg.getParameter<std::string>("doc")), type_(atype),
-                precision_(cfg.existsAs<int>("precision") ? cfg.getParameter<int>("precision") : (cfg.existsAs<std::string>("precision") ? -2 : -1)),
-		        precisionFunc_(cfg.existsAs<std::string>("precision") ? cfg.getParameter<std::string>("precision") : "",true)
+                precision_(cfg.existsAs<int>("precision") ? cfg.getParameter<int>("precision") : (cfg.existsAs<std::string>("precision") ? -2 : -1))
             {
             }
                 virtual ~VariableBase() {}
@@ -72,7 +71,6 @@ class SimpleFlatTableProducerBase : public edm::stream::EDProducer<> {
                 std::string name_, doc_;
                 nanoaod::FlatTable::ColumnType type_;
 		        int precision_;
-                StringObjectFunction<T> precisionFunc_;
         };
         class Variable : public VariableBase {
             public:
@@ -89,7 +87,7 @@ class SimpleFlatTableProducerBase : public edm::stream::EDProducer<> {
                     void fill(std::vector<const T *> selobjs, nanoaod::FlatTable & out) const override {
                         std::vector<ValType> vals(selobjs.size());
                         for (unsigned int i = 0, n = vals.size(); i < n; ++i) {
-                            if(precision_ == -2){
+                            if(this->precision_ == -2){
                             vals[i] = MiniFloatConverter::reduceMantissaToNbitsRounding(func_(*selobjs[i]),precisionFunc_(*selobjs[i]));
                             }
                             else vals[i] = func_(*selobjs[i]);
@@ -106,6 +104,7 @@ class SimpleFlatTableProducerBase : public edm::stream::EDProducer<> {
         typedef FuncVariable<StringObjectFunction<T>,uint8_t> UInt8Var;
         typedef FuncVariable<StringCutObjectSelector<T>,uint8_t> BoolVar;
         boost::ptr_vector<Variable> vars_;
+        precisionFunc_(cfg.existsAs<std::string>("precision") ? cfg.getParameter<std::string>("precision") : "",true);
 };
 
 template<typename T>
@@ -180,10 +179,7 @@ class SimpleFlatTableProducer : public SimpleFlatTableProducerBase<T, edm::View<
                     iEvent.getByToken(token_, vmap);
                     std::vector<ValType> vals(selptrs.size());   
                     for (unsigned int i = 0, n = vals.size(); i < n; ++i) {
-                        if(precision_ == -2){
-                            vals[i] = MiniFloatConverter::reduceMantissaToNbitsRounding(*selptrs[i],precisionFunc_(*selptrs[i]));
-                        }
-                        else vals[i] = (*vmap)[selptrs[i]];
+                        vals[i] = (*vmap)[selptrs[i]];
                     }
                     out.template addColumn<ValType>(this->name_, vals, this->doc_, this->type_, this->precision_);
                 }
@@ -196,6 +192,7 @@ class SimpleFlatTableProducer : public SimpleFlatTableProducerBase<T, edm::View<
         typedef ValueMapVariable<bool,uint8_t> BoolExtVar;
         typedef ValueMapVariable<int,uint8_t> UInt8ExtVar;
         boost::ptr_vector<ExtVariable> extvars_;
+        precisionFunc_(cfg.existsAs<std::string>("precision") ? cfg.getParameter<std::string>("precision") : "",true);
 
 };
 

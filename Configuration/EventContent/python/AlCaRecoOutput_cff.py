@@ -25,6 +25,7 @@ from Alignment.CommonAlignmentProducer.ALCARECOTkAlMuonIsolatedHI_Output_cff imp
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlMuonIsolatedPA_Output_cff import *
 # AlCaReco for track based alignment using J/Psi events
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlJpsiMuMu_Output_cff import *
+from Alignment.CommonAlignmentProducer.ALCARECOTkAlDstToD0Pi_Output_cff import *
 # AlCaReco for track based alignment using J/Psi events for PbPb data-taking
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlJpsiMuMuHI_Output_cff import *
 # AlCaReco for track based alignment using Upsilon events

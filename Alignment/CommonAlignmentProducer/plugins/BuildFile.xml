@@ -55,3 +55,17 @@
 <library   file="LSNumberFilter.cc" name="AlignmentCommonAlignmentProducerFilter">
   <flags   EDM_PLUGIN="1"/>
 </library>
+<library   file="DstToD0PiValidationAnalyzer.cc" name="AlignmentCommonAlignmentProducerValidation">
+  <use   name="CommonTools/UtilAlgos"/>
+  <use   name="DataFormats/TrackReco"/>
+  <use   name="DataFormats/VertexReco"/>
+  <use   name="FWCore/Framework"/>
+  <use   name="FWCore/ParameterSet"/>
+  <use   name="FWCore/ServiceRegistry"/>
+  <use   name="RecoVertex/KinematicFit"/>
+  <use   name="RecoVertex/KinematicFitPrimitives"/>
+  <use   name="TrackingTools/Records"/>
+  <use   name="TrackingTools/TransientTrack"/>
+  <use   name="root"/>
+  <flags   EDM_PLUGIN="1"/>
+</library>

@@ -23,6 +23,7 @@ from Alignment.CommonAlignmentProducer.ALCARECOTkAlMuonIsolated_cff import *
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlMuonIsolatedPA_cff import *
 # AlCaReco for track based alignment using J/Psi events
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlJpsiMuMu_cff import *
+from Alignment.CommonAlignmentProducer.ALCARECOTkAlDstToD0Pi_cff import *
 # AlCaReco for track based alignment using Upsilon events
 from Alignment.CommonAlignmentProducer.ALCARECOTkAlUpsilonMuMu_cff import *
 # AlCaReco for track based alignment using Upsilon events for PA data-taking
@@ -166,6 +167,7 @@ pathALCARECOTkAlZMuMuPA = cms.Path(seqALCARECOTkAlZMuMuPA*ALCARECOTkAlZMuMuPADQM
 pathALCARECOTkAlMuonIsolated = cms.Path(seqALCARECOTkAlMuonIsolated*ALCARECOTkAlMuonIsolatedDQM)
 pathALCARECOTkAlMuonIsolatedPA = cms.Path(seqALCARECOTkAlMuonIsolatedPA*ALCARECOTkAlMuonIsolatedPADQM)
 pathALCARECOTkAlJpsiMuMu = cms.Path(seqALCARECOTkAlJpsiMuMu*ALCARECOTkAlJpsiMuMuDQM)
+pathALCARECOTkAlDstToD0Pi = cms.Path(seqALCARECOTkAlDstToD0Pi)
 pathALCARECOTkAlUpsilonMuMu = cms.Path(seqALCARECOTkAlUpsilonMuMu*ALCARECOTkAlUpsilonMuMuDQM)
 pathALCARECOTkAlUpsilonMuMuPA = cms.Path(seqALCARECOTkAlUpsilonMuMuPA*ALCARECOTkAlUpsilonMuMuPADQM)
 pathALCARECOTkAlMinBias = cms.Path(seqALCARECOTkAlMinBias*ALCARECOTkAlMinBiasDQM)
@@ -327,6 +329,15 @@ ALCARECOStreamTkAlJpsiMuMu = cms.FilteredStream(
 	paths  = (pathALCARECOTkAlJpsiMuMu),
 	content = OutALCARECOTkAlJpsiMuMu.outputCommands,
 	selectEvents = OutALCARECOTkAlJpsiMuMu.SelectEvents,
+	dataTier = cms.untracked.string('ALCARECO')
+	)
+
+ALCARECOStreamTkAlDstToD0Pi = cms.FilteredStream(
+	responsible = 'emanuele manoni',
+	name = 'TkAlDstToD0Pi',
+	paths  = (pathALCARECOTkAlDstToD0Pi),
+	content = OutALCARECOTkAlDstToD0Pi.outputCommands,
+	selectEvents = OutALCARECOTkAlDstToD0Pi.SelectEvents,
 	dataTier = cms.untracked.string('ALCARECO')
 	)
 

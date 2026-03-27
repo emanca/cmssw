@@ -1,4 +1,3 @@
-
 import FWCore.ParameterSet.Config as cms
 
 AlignmentTrackSelector = cms.EDFilter("AlignmentTrackSelectorModule",
@@ -111,6 +110,28 @@ AlignmentTrackSelector = cms.EDFilter("AlignmentTrackSelectorModule",
         applySecThreshold = cms.bool(False),
         secondThreshold = cms.double(6.0)
     ),
+
+    ThreeBodyDecaySelector = cms.PSet(
+        applyMassrangeFilter = cms.bool(False),
+        applyIntermediateMassrangeFilter = cms.bool(False),
+        applyMassDifferenceFilter = cms.bool(False),
+        applyChargeFilter = cms.bool(False),
+
+        minXMass = cms.double(0.0),
+        maxXMass = cms.double(15000.0),
+        minIntermediateMass = cms.double(0.0),
+        maxIntermediateMass = cms.double(15000.0),
+        minMassDifference = cms.double(0.0),
+        maxMassDifference = cms.double(15000.0),
+
+        firstDaughterMass = cms.double(0.493677),
+        secondDaughterMass = cms.double(0.139570),
+        thirdDaughterMass = cms.double(0.139570),
+
+        charge = cms.int32(1),
+        useUnsignedCharge = cms.bool(True),
+        numberOfCandidates = cms.uint32(1)
+    ),
     trackQualities = cms.vstring(), # take all if empty
     iterativeTrackingSteps = cms.vstring(), # take all if empty
     #settings for filtering on the hits taken by the Skim&Prescale workflow
@@ -118,5 +139,3 @@ AlignmentTrackSelector = cms.EDFilter("AlignmentTrackSelectorModule",
     minPrescaledHits = cms.int32(-1)                                  
 
 )
-
-

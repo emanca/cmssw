@@ -1,15 +1,5 @@
 import FWCore.ParameterSet.Config as cms
 
-import HLTrigger.HLTfilters.hltHighLevel_cfi
-ALCARECOTkAlDstToD0PiHLT = HLTrigger.HLTfilters.hltHighLevel_cfi.hltHighLevel.clone(
-    andOr = True,
-    HLTPaths = cms.vstring(
-        'HLT_IsoMu24_v*',
-        'HLT_IsoTkMu24_v*',
-    ),
-    throw = False
-)
-
 import DPGAnalysis.Skims.skim_detstatus_cfi
 ALCARECOTkAlDstToD0PiDCSFilter = DPGAnalysis.Skims.skim_detstatus_cfi.dcsstatus.clone(
     DetectorType = cms.vstring('TIBTID','TOB','TECp','TECm','BPIX','FPIX',
@@ -50,6 +40,5 @@ ALCARECOTkAlDstToD0Pi.ThreeBodyDecaySelector.charge = 1
 ALCARECOTkAlDstToD0Pi.ThreeBodyDecaySelector.useUnsignedCharge = True
 ALCARECOTkAlDstToD0Pi.ThreeBodyDecaySelector.numberOfCandidates = 1
 
-seqALCARECOTkAlDstToD0Pi = cms.Sequence(ALCARECOTkAlDstToD0PiHLT+
-                                        ALCARECOTkAlDstToD0PiDCSFilter+
+seqALCARECOTkAlDstToD0Pi = cms.Sequence(ALCARECOTkAlDstToD0PiDCSFilter+
                                         ALCARECOTkAlDstToD0Pi)

@@ -22,7 +22,7 @@ process.load("Configuration.StandardSequences.GeometrySimDB_cff")
 process.load("TrackingTools.TransientTrack.TransientTrackBuilder_cfi")
 process.load("TrackPropagation.Geant4e.geantRefit_cff")
 
-process.maxEvents = cms.untracked.PSet(input=cms.untracked.int32(-1))
+process.maxEvents = cms.untracked.PSet(input=cms.untracked.int32(options.maxEvents))
 
 process.source = cms.Source(
     "PoolSource",

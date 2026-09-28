@@ -3,6 +3,7 @@ import FWCore.ParameterSet.Config as cms
 from Configuration.Eras.Era_Run2_2016_cff import Run2_2016
 from Configuration.AlCa.GlobalTag import GlobalTag
 from FWCore.ParameterSet.VarParsing import VarParsing
+from Analysis.HitAnalyzer.OniaNtuplizer_cff import onia_settings
 
 
 options = VarParsing("analysis")
@@ -17,6 +18,11 @@ options.register(
 )
 options.parseArguments()
 
+onia = onia_settings("jpsi")
+input_files = list(options.inputFiles)
+if not input_files:
+    input_files = [onia["mc_input"]]
+
 output_base = options.outputFile[:-5] if options.outputFile.endswith(".root") else options.outputFile
 
 
@@ -30,12 +36,13 @@ process.load("Configuration.StandardSequences.FrontierConditions_GlobalTag_cff")
 process.load("Configuration.StandardSequences.GeometrySimDB_cff")
 process.load("TrackPropagation.Geant4e.geantRefit_cff")
 process.load("TrackingTools.TransientTrack.TransientTrackBuilder_cfi")
+process.load("Analysis.HitAnalyzer.ResidualGlobalCorrectionMakerTwoTrackG4e_cfi")
 
 process.maxEvents = cms.untracked.PSet(input=cms.untracked.int32(options.maxEvents))
 
 process.source = cms.Source(
     "PoolSource",
-    fileNames=cms.untracked.vstring(*options.inputFiles),
+    fileNames=cms.untracked.vstring(*input_files),
     secondaryFileNames=cms.untracked.vstring(),
 )
 
@@ -78,15 +85,8 @@ process.refittedMuonTracks = RecoTracker.TrackProducer.TrackRefitter_cfi.TrackRe
     Fitter="FlexibleKFFittingSmoother",
 )
 
-process.globalCor = cms.EDProducer(
-    "ResidualGlobalCorrectionMakerTwoTrackG4e",
+process.globalCor = process.residualGlobalCorrectionMakerTwoTrackG4e.clone(
     src=cms.InputTag("refittedMuonTracks"),
-    fitFromGenParms=cms.bool(False),
-    fitFromSimParms=cms.bool(False),
-    fillTrackTree=cms.bool(True),
-    fillGrads=cms.bool(False),
-    fillJac=cms.bool(True),
-    fillRunTree=cms.bool(True),
     doGen=cms.bool(False),
     genParticles=cms.InputTag("prunedGenParticles"),
     pileupInfo=cms.InputTag("slimmedAddPileupInfo"),
@@ -98,30 +98,11 @@ process.globalCor = cms.EDProducer(
     doTrigger=cms.bool(True),
     doRes=cms.bool(False),
     useIdealGeometry=cms.bool(True),
-    bsConstraint=cms.bool(False),
-    applyHitQuality=cms.bool(True),
     doVtxConstraint=cms.bool(False),
     doMassConstraint=cms.bool(False),
-    massConstraint=cms.double(3.0969),
+    massConstraint=cms.double(onia["mass"]),
     massConstraintWidth=cms.double(1e-5),
-    corFiles=cms.vstring(),
-    triggers=cms.vstring(
-        "HLT_Dimuon0_Jpsi_Muon",
-        "HLT_Dimuon0er16_Jpsi_NoOS_NoVertexing",
-        "HLT_Dimuon0er16_Jpsi_NoOS_NoVertexing",
-        "HLT_Dimuon10_Jpsi_Barrel",
-        "HLT_Dimuon13_PsiPrime",
-        "HLT_Dimuon16_Jpsi",
-        "HLT_Dimuon20_Jpsi",
-        "HLT_Dimuon8_PsiPrime_Barrel",
-        "HLT_DoubleMu4_3_Bs",
-        "HLT_DoubleMu4_3_Jpsi_Displaced",
-        "HLT_DoubleMu4_JpsiTrk_Displaced",
-        "HLT_DoubleMu4_PsiPrimeTrk_Displaced",
-        "HLT_Mu7p5_Track2_Jpsi",
-        "HLT_Mu7p5_Track3p5_Jpsi",
-        "HLT_Mu7p5_Track7_Jpsi",
-    ),
+    triggers=cms.vstring(*onia["triggers"]),
     MagneticFieldLabel=cms.string(""),
     outprefix=cms.untracked.string(output_base),
 )

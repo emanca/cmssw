@@ -26,6 +26,8 @@
 
 #include "FWCore/Common/interface/TriggerNames.h"
 
+#include <exception>
+
 
 class ResidualGlobalCorrectionMakerTwoTrackG4e : public ResidualGlobalCorrectionMakerBase
 {
@@ -909,11 +911,23 @@ void ResidualGlobalCorrectionMakerTwoTrackG4e::produce(edm::Event &iEvent, const
           double kinconstraintval = massconstraintval;
           TwoTrackMassKinematicConstraint constraint(kinconstraintval);
           KinematicConstrainedVertexFitter vtxFitter;
-          kinTree = vtxFitter.fit(parts, &constraint);
+          try {
+            kinTree = vtxFitter.fit(parts, &constraint);
+          } catch (const std::exception& e) {
+            std::cout << "Abort: kinematic fit exception: " << e.what() << "\n";
+            valid = false;
+            break;
+          }
         }
         else {
           KinematicParticleVertexFitter vtxFitter;
-          kinTree = vtxFitter.fit(parts);
+          try {
+            kinTree = vtxFitter.fit(parts);
+          } catch (const std::exception& e) {
+            std::cout << "Abort: kinematic fit exception: " << e.what() << "\n";
+            valid = false;
+            break;
+          }
         }
         
         if (kinTree->isEmpty() || !kinTree->isConsistent()) {

@@ -271,6 +271,8 @@ protected:
   
   TFile *fout = nullptr;
   TTree *tree = nullptr;
+  bool appendToTFileService_ = false;
+  std::string appendTreeName_ = "Events";
 //   TTree *runtree;
 //   TTree *gradtree;
 //   TTree *hesstree;
@@ -502,6 +504,7 @@ protected:
   TH2D *hetaphi = nullptr;
 
   std::string outprefix;
+  bool appendStreamIdToOutput_ = true;
   
 //   bool filledRunTree_;
   

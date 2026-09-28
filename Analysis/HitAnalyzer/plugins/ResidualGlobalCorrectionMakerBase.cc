@@ -74,6 +74,7 @@
 
 #include "FWCore/ServiceRegistry/interface/Service.h"
 #include "CommonTools/UtilAlgos/interface/TFileService.h"
+#include "FWCore/Utilities/interface/Exception.h"
 
 #include "Alignment/CommonAlignment/interface/Utilities.h"
 #include "TRandom.h"
@@ -127,6 +128,8 @@ ResidualGlobalCorrectionMakerBase::ResidualGlobalCorrectionMakerBase(const edm::
   fillGrads_ = iConfig.getParameter<bool>("fillGrads");
   fillJac_ = iConfig.getParameter<bool>("fillJac");
   fillRunTree_ = iConfig.getParameter<bool>("fillRunTree");
+  appendStreamIdToOutput_ =
+      iConfig.existsAs<bool>("appendStreamIdToOutput") ? iConfig.getParameter<bool>("appendStreamIdToOutput") : true;
   doGen_ = iConfig.getParameter<bool>("doGen");
   requireGen_ = iConfig.getParameter<bool>("requireGen");
   doSim_ = iConfig.getParameter<bool>("doSim");
@@ -205,6 +208,11 @@ ResidualGlobalCorrectionMakerBase::ResidualGlobalCorrectionMakerBase(const edm::
   
 
   outprefix = iConfig.getUntrackedParameter<std::string>("outprefix", "globalcor");
+  appendToTFileService_ =
+      iConfig.existsAs<bool>("appendToTFileService") ? iConfig.getParameter<bool>("appendToTFileService") : false;
+  appendTreeName_ = iConfig.existsAs<std::string>("appendTreeName")
+                        ? iConfig.getParameter<std::string>("appendTreeName")
+                        : "Events";
 
 }
 
@@ -223,10 +231,30 @@ ResidualGlobalCorrectionMakerBase::~ResidualGlobalCorrectionMakerBase()
 // ------------ method called once each job just before starting event loop  ------------
 void ResidualGlobalCorrectionMakerBase::beginStream(edm::StreamID streamid)
 {
+  if (appendToTFileService_) {
+    if (!fillTrackTree_) {
+      return;
+    }
+
+    edm::Service<TFileService> fs;
+    TObject *object = fs->file().Get(appendTreeName_.c_str());
+    tree = dynamic_cast<TTree *>(object);
+    if (tree == nullptr) {
+      throw cms::Exception("Configuration")
+        << "ResidualGlobalCorrectionMakerBase requested appendToTFileService, but no TTree at path '"
+          << appendTreeName_ << "' exists in the TFileService file.";
+    }
+    return;
+  }
+
   if (fillTrackTree_ || fillRunTree_) {
     std::stringstream filenamestream;
 //     filenamestream << "globalcor_" << streamid.value() << ".root";
-    filenamestream << outprefix << "_" << streamid.value() << ".root";
+    filenamestream << outprefix;
+    if (appendStreamIdToOutput_) {
+      filenamestream << "_" << streamid.value();
+    }
+    filenamestream << ".root";
     // std::cout << "file is: " << filenamestream.str().c_str() << std::endl;
     fout = new TFile(filenamestream.str().c_str(), "RECREATE");
     // std::cout << "filename is: " << fout->GetName() << std::endl;
@@ -553,9 +581,14 @@ ResidualGlobalCorrectionMakerBase::beginRun(edm::Run const& run, edm::EventSetup
 
   //   assert(0);
     if (fillRunTree_) {
-    //   TFile *runfout = new TFile("trackTreeGradsParmInfo.root", "RECREATE");
-      fout->cd();
-      runtree = new TTree("runtree", "");
+      if (appendToTFileService_) {
+        edm::Service<TFileService> fs;
+        runtree = fs->make<TTree>("CVH_runtree", "");
+      } else {
+        //   TFile *runfout = new TFile("trackTreeGradsParmInfo.root", "RECREATE");
+        fout->cd();
+        runtree = new TTree("runtree", "");
+      }
 
       runtree->Branch("iidx", &iidx);
       runtree->Branch("parmtype", &parmtype);

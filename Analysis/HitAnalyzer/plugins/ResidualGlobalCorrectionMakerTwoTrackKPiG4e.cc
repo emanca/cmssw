@@ -19,8 +19,13 @@
 #include "RecoVertex/KinematicFit/interface/CombinedKinematicConstraint.h"
 #include "DataFormats/MuonReco/interface/Muon.h"
 #include "DataFormats/Math/interface/deltaR.h"
+#include "DataFormats/Common/interface/ValueMap.h"
+#include "DataFormats/VertexReco/interface/Vertex.h"
+#include "DataFormats/VertexReco/interface/VertexFwd.h"
+#include "DataFormats/BeamSpot/interface/BeamSpot.h"
 
 #include "Math/Vector4Dfwd.h"
+#include "Math/Vector4D.h"
 
 #include "TrackPropagation/Geant4e/interface/Geant4ePropagator.h"
 
@@ -30,8 +35,449 @@
 #include "CondFormats/L1TObjects/interface/L1GtTriggerMenu.h"
 
 #include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
 #include <limits>
 #include <sstream>
+#include <unordered_set>
+
+namespace {
+enum class D0CvhFailureCode : std::uint8_t {
+  kSuccess = 0,
+  kCandidatePrecondition = 1,
+  kNoUsableTrackerHits = 2,
+  kKinematicFit = 3,
+  kG4eFit = 4,
+  kNumericalFit = 5,
+};
+
+class DstCandidateFillGuard {
+public:
+  DstCandidateFillGuard(TTree* tree, bool enabled) : tree_(tree), enabled_(enabled) {}
+  ~DstCandidateFillGuard() { fill(); }
+
+  void fill() {
+    if (enabled_ && !filled_) {
+      tree_->Fill();
+      filled_ = true;
+    }
+  }
+
+private:
+  TTree* tree_;
+  bool enabled_;
+  bool filled_ = false;
+};
+
+struct DstCheapLine {
+  double x = 0.;
+  double y = 0.;
+  double z = 0.;
+  double ux = 0.;
+  double uy = 0.;
+  double uz = 0.;
+};
+
+struct DstCheapCAResult {
+  double dxy = 999.;
+  double dz = 999.;
+  double dist3d = 999.;
+  double midX = 0.;
+  double midY = 0.;
+  double midZ = 0.;
+};
+
+struct DstLineImpactParameters {
+  double dxy = -99.;
+  double sigdxy = -99.;
+  double dz = -99.;
+  double sigdz = -99.;
+};
+
+struct DstLineState {
+  double x = 0.;
+  double y = 0.;
+  double z = 0.;
+  double px = 0.;
+  double py = 0.;
+  double pz = 0.;
+};
+
+DstCheapLine makeDstCheapLine(const reco::Track& track) {
+  const double norm = std::max(track.p(), 1.e-12);
+  return {track.vx(), track.vy(), track.vz(), track.px() / norm, track.py() / norm, track.pz() / norm};
+}
+
+DstCheapLine makeDstCheapLine(double x, double y, double z, double px, double py, double pz) {
+  const double norm = std::max(std::sqrt(px * px + py * py + pz * pz), 1.e-12);
+  return {x, y, z, px / norm, py / norm, pz / norm};
+}
+
+DstCheapCAResult dstCheapClosestApproachXY(const DstCheapLine& a, const DstCheapLine& b) {
+  const double dx = b.x - a.x;
+  const double dy = b.y - a.y;
+  const double aa = a.ux * a.ux + a.uy * a.uy;
+  const double bb = b.ux * b.ux + b.uy * b.uy;
+  const double ab = a.ux * b.ux + a.uy * b.uy;
+  const double ad = a.ux * dx + a.uy * dy;
+  const double bd = b.ux * dx + b.uy * dy;
+  const double det = aa * bb - ab * ab;
+
+  double sa = 0.;
+  double sb = 0.;
+  if (std::abs(det) > 1.e-12) {
+    sa = (ad * bb - bd * ab) / det;
+    sb = (ad * ab - bd * aa) / det;
+  }
+
+  const double ax = a.x + sa * a.ux;
+  const double ay = a.y + sa * a.uy;
+  const double az = a.z + sa * a.uz;
+  const double bx = b.x + sb * b.ux;
+  const double by = b.y + sb * b.uy;
+  const double bz = b.z + sb * b.uz;
+  const double dxy = std::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by));
+  const double dz = az - bz;
+  return {dxy, dz, std::sqrt(dxy * dxy + dz * dz), 0.5 * (ax + bx), 0.5 * (ay + by), 0.5 * (az + bz)};
+}
+
+ROOT::Math::PxPyPzMVector dstTrackP4(const reco::Track& track, double mass) {
+  return ROOT::Math::PxPyPzMVector(track.px(), track.py(), track.pz(), mass);
+}
+
+double dstDeltaPhi(double phi1, double phi2) {
+  double dphi = phi1 - phi2;
+  while (dphi > M_PI)
+    dphi -= 2. * M_PI;
+  while (dphi <= -M_PI)
+    dphi += 2. * M_PI;
+  return dphi;
+}
+
+double dstDeltaR(double eta1, double phi1, double eta2, double phi2) {
+  const double dphi = dstDeltaPhi(phi1, phi2);
+  const double deta = eta1 - eta2;
+  return std::sqrt(deta * deta + dphi * dphi);
+}
+
+double dstSignedValueSignificance(double value, double error) {
+  if (error <= 0. || !std::isfinite(error))
+    return -99.;
+  return std::abs(value) / error;
+}
+
+bool dstAllFinite(const std::vector<float>& values) {
+  return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+}
+
+bool dstD0MassJacobian(const Matrix<double, 10, 1>& fittedPca,
+                       double mass0,
+                       double mass1,
+                       Matrix<double, 1, 6>& jacobian) {
+  jacobian.setConstant(std::numeric_limits<double>::quiet_NaN());
+
+  const double qop0 = fittedPca[0];
+  const double lambda0 = fittedPca[1];
+  const double phi0 = fittedPca[2];
+  const double qop1 = fittedPca[3];
+  const double lambda1 = fittedPca[4];
+  const double phi1 = fittedPca[5];
+  if (!std::isfinite(qop0) || !std::isfinite(lambda0) || !std::isfinite(phi0) ||
+      !std::isfinite(qop1) || !std::isfinite(lambda1) || !std::isfinite(phi1) ||
+      !std::isfinite(mass0) || !std::isfinite(mass1) || mass0 < 0. || mass1 < 0. ||
+      qop0 == 0. || qop1 == 0.) {
+    return false;
+  }
+
+  const double p0 = 1. / std::abs(qop0);
+  const double p1 = 1. / std::abs(qop1);
+  const double energy0 = std::sqrt(p0 * p0 + mass0 * mass0);
+  const double energy1 = std::sqrt(p1 * p1 + mass1 * mass1);
+  const double deltaPhi = phi0 - phi1;
+  const double cosOpening = std::cos(lambda0) * std::cos(lambda1) * std::cos(deltaPhi) +
+                            std::sin(lambda0) * std::sin(lambda1);
+  const double massSquared = mass0 * mass0 + mass1 * mass1 +
+                             2. * (energy0 * energy1 - p0 * p1 * cosOpening);
+  if (!std::isfinite(p0) || !std::isfinite(p1) || !std::isfinite(energy0) ||
+      !std::isfinite(energy1) || !std::isfinite(massSquared) || massSquared <= 0.) {
+    return false;
+  }
+
+  const double mass = std::sqrt(massSquared);
+  const double dp0dQop = -std::copysign(1., qop0) / (qop0 * qop0);
+  const double dp1dQop = -std::copysign(1., qop1) / (qop1 * qop1);
+  const double dCosDlambda0 = -std::sin(lambda0) * std::cos(lambda1) * std::cos(deltaPhi) +
+                              std::cos(lambda0) * std::sin(lambda1);
+  const double dCosDlambda1 = -std::cos(lambda0) * std::sin(lambda1) * std::cos(deltaPhi) +
+                              std::sin(lambda0) * std::cos(lambda1);
+  const double dCosDphi0 = -std::cos(lambda0) * std::cos(lambda1) * std::sin(deltaPhi);
+  const double dCosDphi1 = -dCosDphi0;
+
+  jacobian(0, 0) = dp0dQop * (energy1 * p0 / energy0 - p1 * cosOpening) / mass;
+  jacobian(0, 1) = -p0 * p1 * dCosDlambda0 / mass;
+  jacobian(0, 2) = -p0 * p1 * dCosDphi0 / mass;
+  jacobian(0, 3) = dp1dQop * (energy0 * p1 / energy1 - p0 * cosOpening) / mass;
+  jacobian(0, 4) = -p0 * p1 * dCosDlambda1 / mass;
+  jacobian(0, 5) = -p0 * p1 * dCosDphi1 / mass;
+
+  for (unsigned int ipar = 0; ipar < 6; ++ipar) {
+    if (!std::isfinite(jacobian(0, ipar))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::array<double, 2> dstLineImpactValues(const DstLineState& state, double refX, double refY, double refZ) {
+  const double pnorm = std::sqrt(state.px * state.px + state.py * state.py + state.pz * state.pz);
+  if (pnorm <= 0.)
+    return {{-99., -99.}};
+
+  const double ux = state.px / pnorm;
+  const double uy = state.py / pnorm;
+  const double uz = state.pz / pnorm;
+  const double ut2 = ux * ux + uy * uy;
+  if (ut2 <= 0.)
+    return {{-99., -99.}};
+
+  const double dx = state.x - refX;
+  const double dy = state.y - refY;
+  const double dxy = -dx * uy + dy * ux;
+  const double tca = ((refX - state.x) * ux + (refY - state.y) * uy) / ut2;
+  const double dz = state.z + tca * uz - refZ;
+  return {{dxy, dz}};
+}
+
+DstLineImpactParameters dstLineImpactParameters(const DstLineState& state,
+                                                double refX,
+                                                double refY,
+                                                double refZ,
+                                                const Eigen::Matrix<double, 6, 6>& stateCov,
+                                                const Eigen::Matrix<double, 3, 3>& refCov) {
+  DstLineImpactParameters result;
+  const auto base = dstLineImpactValues(state, refX, refY, refZ);
+  result.dxy = base[0];
+  result.dz = base[1];
+  if (result.dxy == -99. || result.dz == -99.)
+    return result;
+
+  Eigen::Matrix<double, 2, 6> stateJac = Eigen::Matrix<double, 2, 6>::Zero();
+  Eigen::Matrix<double, 2, 3> refJac = Eigen::Matrix<double, 2, 3>::Zero();
+  const Eigen::Matrix<double, 6, 1> nominalState =
+      (Eigen::Matrix<double, 6, 1>() << state.x, state.y, state.z, state.px, state.py, state.pz).finished();
+  const std::array<double, 6> stateSteps = {{1.e-5, 1.e-5, 1.e-5, 1.e-5, 1.e-5, 1.e-5}};
+  for (unsigned int ipar = 0; ipar < 6; ++ipar) {
+    Eigen::Matrix<double, 6, 1> up = nominalState;
+    Eigen::Matrix<double, 6, 1> down = nominalState;
+    up(ipar) += stateSteps[ipar];
+    down(ipar) -= stateSteps[ipar];
+    const DstLineState upState{up(0), up(1), up(2), up(3), up(4), up(5)};
+    const DstLineState downState{down(0), down(1), down(2), down(3), down(4), down(5)};
+    const auto upValues = dstLineImpactValues(upState, refX, refY, refZ);
+    const auto downValues = dstLineImpactValues(downState, refX, refY, refZ);
+    stateJac(0, ipar) = (upValues[0] - downValues[0]) / (2. * stateSteps[ipar]);
+    stateJac(1, ipar) = (upValues[1] - downValues[1]) / (2. * stateSteps[ipar]);
+  }
+
+  const Eigen::Matrix<double, 3, 1> nominalRef(refX, refY, refZ);
+  const std::array<double, 3> refSteps = {{1.e-5, 1.e-5, 1.e-5}};
+  for (unsigned int ipar = 0; ipar < 3; ++ipar) {
+    Eigen::Matrix<double, 3, 1> up = nominalRef;
+    Eigen::Matrix<double, 3, 1> down = nominalRef;
+    up(ipar) += refSteps[ipar];
+    down(ipar) -= refSteps[ipar];
+    const auto upValues = dstLineImpactValues(state, up(0), up(1), up(2));
+    const auto downValues = dstLineImpactValues(state, down(0), down(1), down(2));
+    refJac(0, ipar) = (upValues[0] - downValues[0]) / (2. * refSteps[ipar]);
+    refJac(1, ipar) = (upValues[1] - downValues[1]) / (2. * refSteps[ipar]);
+  }
+
+  const Eigen::Matrix<double, 2, 2> impactCov = stateJac * stateCov * stateJac.transpose() +
+                                                refJac * refCov * refJac.transpose();
+  const double dxyVariance = impactCov(0, 0);
+  const double dzVariance = impactCov(1, 1);
+  if (dxyVariance > 0. && std::isfinite(dxyVariance)) {
+    result.sigdxy = std::abs(result.dxy) / std::sqrt(dxyVariance);
+  }
+  if (dzVariance > 0. && std::isfinite(dzVariance)) {
+    result.sigdz = std::abs(result.dz) / std::sqrt(dzVariance);
+  }
+
+  return result;
+}
+
+Eigen::Matrix<double, 3, 3> dstPrimaryVertexCovariance(const reco::Vertex& pv) {
+  Eigen::Matrix<double, 3, 3> cov;
+  for (unsigned int i = 0; i < 3; ++i) {
+    for (unsigned int j = 0; j < 3; ++j) {
+      cov(i, j) = pv.covariance(i, j);
+    }
+  }
+  return cov;
+}
+
+Eigen::Matrix<double, 3, 3> dstBeamSpotPointCovariance(const reco::BeamSpot& beamSpot) {
+  Eigen::Matrix<double, 3, 3> cov = Eigen::Matrix<double, 3, 3>::Zero();
+  cov(0, 0) = beamSpot.BeamWidthX() * beamSpot.BeamWidthX();
+  cov(1, 1) = beamSpot.BeamWidthY() * beamSpot.BeamWidthY();
+  cov(2, 2) = beamSpot.sigmaZ() * beamSpot.sigmaZ();
+  return cov;
+}
+
+Eigen::Matrix<double, 3, 3> dstPackedUpperTriangularCovariance(const std::vector<float>& packedCov) {
+  Eigen::Matrix<double, 3, 3> cov = Eigen::Matrix<double, 3, 3>::Zero();
+  if (packedCov.size() < 9)
+    return cov;
+  Eigen::Map<const Eigen::Matrix<float, 3, 3, Eigen::RowMajor>> input(packedCov.data(), 3, 3);
+  for (unsigned int i = 0; i < 3; ++i) {
+    for (unsigned int j = i; j < 3; ++j) {
+      cov(i, j) = input(i, j);
+      cov(j, i) = input(i, j);
+    }
+  }
+  return cov;
+}
+
+double dstPointingCos3D(const reco::Vertex& pv, double x, double y, double z, double px, double py, double pz) {
+  const double dx = x - pv.x();
+  const double dy = y - pv.y();
+  const double dz = z - pv.z();
+  const double l = std::sqrt(dx * dx + dy * dy + dz * dz);
+  const double p = std::sqrt(px * px + py * py + pz * pz);
+  if (l <= 0. || p <= 0.)
+    return -99.;
+  return (dx * px + dy * py + dz * pz) / (l * p);
+}
+
+double dstPointingCos2D(const reco::Vertex& pv, double x, double y, double px, double py) {
+  const double dx = x - pv.x();
+  const double dy = y - pv.y();
+  const double l = std::sqrt(dx * dx + dy * dy);
+  const double p = std::sqrt(px * px + py * py);
+  if (l <= 0. || p <= 0.)
+    return -99.;
+  return (dx * px + dy * py) / (l * p);
+}
+
+double dstVertexDistance3D(const reco::Vertex& pv, double x, double y, double z) {
+  const double dx = x - pv.x();
+  const double dy = y - pv.y();
+  const double dz = z - pv.z();
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+double dstVertexDistance2D(const reco::Vertex& pv, double x, double y) {
+  const double dx = x - pv.x();
+  const double dy = y - pv.y();
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+double dstVertexDistanceSignificance3D(const reco::Vertex& pv,
+                                        double x,
+                                        double y,
+                                        double z,
+                                        const Eigen::Matrix<double, 3, 3>& vtxCov) {
+  const Eigen::Matrix<double, 3, 1> disp(x - pv.x(), y - pv.y(), z - pv.z());
+  const double dist = disp.norm();
+  if (dist <= 0.)
+    return -99.;
+
+  Eigen::Matrix<double, 3, 3> totalCov = vtxCov;
+  for (unsigned int i = 0; i < 3; ++i) {
+    for (unsigned int j = 0; j < 3; ++j) {
+      totalCov(i, j) += pv.covariance(i, j);
+    }
+  }
+
+  const Eigen::Matrix<double, 3, 1> direction = disp / dist;
+  const double variance = (direction.transpose() * totalCov * direction)(0, 0);
+  if (variance <= 0. || !std::isfinite(variance))
+    return -99.;
+  return dist / std::sqrt(variance);
+}
+
+double dstVertexDistanceSignificance2D(const reco::Vertex& pv,
+                                        double x,
+                                        double y,
+                                        const Eigen::Matrix<double, 3, 3>& vtxCov) {
+  const Eigen::Matrix<double, 2, 1> disp(x - pv.x(), y - pv.y());
+  const double dist = disp.norm();
+  if (dist <= 0.)
+    return -99.;
+
+  Eigen::Matrix<double, 2, 2> totalCov;
+  totalCov(0, 0) = vtxCov(0, 0) + pv.covariance(0, 0);
+  totalCov(0, 1) = vtxCov(0, 1) + pv.covariance(0, 1);
+  totalCov(1, 0) = vtxCov(1, 0) + pv.covariance(1, 0);
+  totalCov(1, 1) = vtxCov(1, 1) + pv.covariance(1, 1);
+
+  const Eigen::Matrix<double, 2, 1> direction = disp / dist;
+  const double variance = (direction.transpose() * totalCov * direction)(0, 0);
+  if (variance <= 0. || !std::isfinite(variance))
+    return -99.;
+  return dist / std::sqrt(variance);
+}
+
+double dstVertexTransverseDistanceFromBeamSpot(const reco::BeamSpot& beamSpot, double x, double y, double z) {
+  const double dz = z - beamSpot.z0();
+  const double bsX = beamSpot.x0() + beamSpot.dxdz() * dz;
+  const double bsY = beamSpot.y0() + beamSpot.dydz() * dz;
+  const double dx = x - bsX;
+  const double dy = y - bsY;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+double dstBeamSpotTransverseDistanceSignificance(const reco::BeamSpot& beamSpot,
+                                                 double x,
+                                                 double y,
+                                                 double z,
+                                                 const Eigen::Matrix<double, 3, 3>& vtxCov) {
+  const double dz = z - beamSpot.z0();
+  const double bsX = beamSpot.x0() + beamSpot.dxdz() * dz;
+  const double bsY = beamSpot.y0() + beamSpot.dydz() * dz;
+  const Eigen::Matrix<double, 2, 1> disp(x - bsX, y - bsY);
+  const double dist = disp.norm();
+  if (dist <= 0.)
+    return -99.;
+
+  Eigen::Matrix<double, 2, 3> jac;
+  jac << 1., 0., -beamSpot.dxdz(),
+         0., 1., -beamSpot.dydz();
+  Eigen::Matrix<double, 2, 2> totalCov = jac * vtxCov * jac.transpose();
+  totalCov(0, 0) += beamSpot.BeamWidthX() * beamSpot.BeamWidthX();
+  totalCov(1, 1) += beamSpot.BeamWidthY() * beamSpot.BeamWidthY();
+
+  const Eigen::Matrix<double, 2, 1> direction = disp / dist;
+  const double variance = (direction.transpose() * totalCov * direction)(0, 0);
+  if (variance <= 0. || !std::isfinite(variance))
+    return -99.;
+  return dist / std::sqrt(variance);
+}
+}
+
+class TTreeBranchProxy {
+public:
+  TTreeBranchProxy(TTree* target, bool prefix) : target_(target), prefix_(prefix ? "CVH_" : "") {}
+
+  TTreeBranchProxy* operator->() { return this; }
+
+  template <typename T>
+  void Branch(const char* name, T* address) {
+    const std::string qualifiedName = prefix_ + name;
+    target_->Branch(qualifiedName.c_str(), address);
+  }
+
+  template <typename T>
+  void Branch(const char* name, T* address, const char* leafList) {
+    const std::string qualifiedName = prefix_ + name;
+    target_->Branch(qualifiedName.c_str(), address, leafList);
+  }
+
+private:
+  TTree* target_;
+  std::string prefix_;
+};
 
 
 class ResidualGlobalCorrectionMakerTwoTrackKPiG4e : public ResidualGlobalCorrectionMakerBase
@@ -53,11 +499,27 @@ private:
   double massConstraintWidth_;
   double kaonMass_;
   double pionMass_;
+  double softPionMass_;
   double kaonMassErr_;
   double pionMassErr_;
   double minPairMass_;
   double maxPairMass_;
   bool respectTrackOrder_;
+  bool useDstarTriplets_;
+  bool enforceUniqueTracks_;
+  bool writeLegacyBranches_;
+  double dstIsoCone_;
+  bool useSoftPionCvh_;
+  bool saveGenParticles_;
+  bool fillTruthMatchOnCvhFailure_;
+  edm::EDGetTokenT<reco::VertexCollection> vertexToken_;
+  edm::EDGetTokenT<edm::View<reco::Candidate>> genParticlesForTreeToken_;
+  edm::EDGetTokenT<edm::ValueMap<float>> softPionCvhPtToken_;
+  edm::EDGetTokenT<edm::ValueMap<float>> softPionCvhEtaToken_;
+  edm::EDGetTokenT<edm::ValueMap<float>> softPionCvhPhiToken_;
+  edm::EDGetTokenT<edm::ValueMap<int>> softPionCvhChargeToken_;
+  edm::EDGetTokenT<edm::ValueMap<float>> softPionCvhEdmvalToken_;
+  edm::EDGetTokenT<edm::ValueMap<std::vector<float>>> softPionCvhMomCovToken_;
 
   bool doL1Trigger_;
   edm::EDGetTokenT<L1GlobalTriggerReadoutRecord> inputL1ReadoutRecord_;
@@ -172,6 +634,11 @@ private:
   std::vector<float> Muplus_jacRef;
   std::vector<float> Muminus_jacRef;
   std::vector<float> Jpsi_jacMass;
+  std::vector<float> K_jacRef;
+  std::vector<float> pi_jacRef;
+  std::vector<float> D0_jacMass;
+  bool D0_jacobianValid = false;
+  unsigned int D0_jacobianSchemaVersion = 1;
   
   unsigned int Muplus_nhits;
   unsigned int Muplus_nvalid;
@@ -216,6 +683,154 @@ private:
   
   float dmassconvval_cons0 = 0.;
   float dinvmasssqconvval_cons0 = 0.;
+
+  float raw_D0_mass = -99.;
+  float raw_Dst_mass = -99.;
+  float raw_DeltaM = -99.;
+  float Dst_pt = -99.;
+  float Dst_eta = -99.;
+  float Dst_phi = -99.;
+  float Dst_iso = -99.;
+  float pis_dR_D0raw = -99.;
+  float cheapCA_Kpi_dxy = -99.;
+  float cheapCA_Kpi_zAtCA = -99.;
+  float cheapCA_Kpi_3d = -99.;
+  float cheapCA_D0pis_dxy = -99.;
+  float cheapCA_D0pis_zAtCA = -99.;
+  float cheapCA_D0pis_3d = -99.;
+
+  float chi2_piK = -99.;
+  float pval_piK = -99.;
+  float mass_piK = -99.;
+  float D0_fit_mass = -99.;
+  float cos_D0_PV = -99.;
+  float cosT_D0_PV = -99.;
+  float d_vtxD0_PV = -99.;
+  float sigd_vtxD0_PV = -99.;
+  float dxy_vtxD0_BS = -99.;
+  float sigdxy_vtxD0_BS = -99.;
+  float chi2_D0pis = -99.;
+  float pval_D0pis = -99.;
+  float mass_D0pis = -99.;
+  float deltaM_D0pis_piK = -99.;
+  float Dst_fit_mass = -99.;
+  float Dst_fit_deltaM = -99.;
+  float cos_Dst_PV = -99.;
+  float cosT_Dst_PV = -99.;
+  float d_vtxDst_PV = -99.;
+  float sigd_vtxDst_PV = -99.;
+  float dxy_vtxDst_PV = -99.;
+  float sigdxy_vtxDst_PV = -99.;
+  float Dst_sumPtCone04 = -99.;
+  float pis_dR_D0 = -99.;
+
+  int K_charge = 0;
+  int pi_charge = 0;
+  int pis_charge = 0;
+  float K_pt = -99.;
+  float K_eta = -99.;
+  float K_phi = -99.;
+  float pi_pt = -99.;
+  float pi_eta = -99.;
+  float pi_phi = -99.;
+  float pis_pt = -99.;
+  float pis_eta = -99.;
+  float pis_phi = -99.;
+  float K_dxy_BS = -99.;
+  float K_sigdxy_BS = -99.;
+  float K_dz_BS = -99.;
+  float K_sigdz_BS = -99.;
+  float K_dxy_PV = -99.;
+  float K_sigdxy_PV = -99.;
+  float K_dz_PV = -99.;
+  float K_sigdz_PV = -99.;
+  float pi_dxy_BS = -99.;
+  float pi_sigdxy_BS = -99.;
+  float pi_dz_BS = -99.;
+  float pi_sigdz_BS = -99.;
+  float pi_dxy_PV = -99.;
+  float pi_sigdxy_PV = -99.;
+  float pi_dz_PV = -99.;
+  float pi_sigdz_PV = -99.;
+  float pis_dxy_BS = -99.;
+  float pis_sigdxy_BS = -99.;
+  float pis_dz_BS = -99.;
+  float pis_sigdz_BS = -99.;
+  float pis_dxy_PV = -99.;
+  float pis_sigdxy_PV = -99.;
+  float pis_dz_PV = -99.;
+  float pis_sigdz_PV = -99.;
+
+  float D0_raw_pt = -99.;
+  float D0_raw_eta = -99.;
+  float D0_raw_phi = -99.;
+  float D0_CVH_d = -99.;
+  float D0_CVH_x = -99.;
+  float D0_CVH_y = -99.;
+  float D0_CVH_z = -99.;
+  float D0_CVH_pt = -99.;
+  float D0_CVH_eta = -99.;
+  float D0_CVH_phi = -99.;
+  float D0_CVH_mass = -99.;
+  float D0_CVH_sigmaMass = -99.;
+  float D0_CVH_edmval = -99.;
+  int D0_CVH_niter = -1;
+  bool D0_CVH_valid = false;
+  std::uint8_t D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kCandidatePrecondition);
+  float K_CVH_pt = -99.;
+  float K_CVH_eta = -99.;
+  float K_CVH_phi = -99.;
+  float K_CVH_dxy_BS = -99.;
+  float K_CVH_sigdxy_BS = -99.;
+  float K_CVH_dz_BS = -99.;
+  float K_CVH_sigdz_BS = -99.;
+  float K_CVH_dxy_PV = -99.;
+  float K_CVH_sigdxy_PV = -99.;
+  float K_CVH_dz_PV = -99.;
+  float K_CVH_sigdz_PV = -99.;
+  float pi_CVH_pt = -99.;
+  float pi_CVH_eta = -99.;
+  float pi_CVH_phi = -99.;
+  float pi_CVH_dxy_BS = -99.;
+  float pi_CVH_sigdxy_BS = -99.;
+  float pi_CVH_dz_BS = -99.;
+  float pi_CVH_sigdz_BS = -99.;
+  float pi_CVH_dxy_PV = -99.;
+  float pi_CVH_sigdxy_PV = -99.;
+  float pi_CVH_dz_PV = -99.;
+  float pi_CVH_sigdz_PV = -99.;
+  float pis_CVH_pt = -99.;
+  float pis_CVH_eta = -99.;
+  float pis_CVH_phi = -99.;
+  int pis_CVH_charge = 0;
+  float pis_CVH_edmval = -99.;
+  float pis_CVH_dxy_BS = -99.;
+  float pis_CVH_sigdxy_BS = -99.;
+  float pis_CVH_dz_BS = -99.;
+  float pis_CVH_sigdz_BS = -99.;
+  float pis_CVH_dxy_PV = -99.;
+  float pis_CVH_sigdxy_PV = -99.;
+  float pis_CVH_dz_PV = -99.;
+  float pis_CVH_sigdz_PV = -99.;
+  float Dst_CVH_mass = -99.;
+  float Dst_CVH_deltaM = -99.;
+  float Dst_CVH3_mass = -99.;
+  float Dst_CVH3_deltaM = -99.;
+
+  std::vector<int> gen_pdgId;
+  std::vector<int> gen_status;
+  std::vector<int> gen_charge;
+  std::vector<int> gen_motherPdgId;
+  std::vector<int> gen_grandmotherPdgId;
+  std::vector<float> gen_pt;
+  std::vector<float> gen_eta;
+  std::vector<float> gen_phi;
+  std::vector<float> gen_mass;
+  std::vector<float> gen_vx;
+  std::vector<float> gen_vy;
+  std::vector<float> gen_vz;
+
+  void resetDstCandidateBranches();
   
 //   std::vector<float> hessv;
   
@@ -233,12 +848,38 @@ ResidualGlobalCorrectionMakerTwoTrackKPiG4e::ResidualGlobalCorrectionMakerTwoTra
   massConstraintWidth_ = iConfig.getParameter<double>("massConstraintWidth");
   kaonMass_ = iConfig.getParameter<double>("kaonMass");
   pionMass_ = iConfig.getParameter<double>("pionMass");
+  softPionMass_ = iConfig.existsAs<double>("softPionMass") ? iConfig.getParameter<double>("softPionMass") : pionMass_;
   kaonMassErr_ = iConfig.existsAs<double>("kaonMassErr") ? iConfig.getParameter<double>("kaonMassErr") : 1.e-6;
   pionMassErr_ = iConfig.existsAs<double>("pionMassErr") ? iConfig.getParameter<double>("pionMassErr") : 1.e-6;
   minPairMass_ = iConfig.getParameter<double>("minPairMass");
   maxPairMass_ = iConfig.getParameter<double>("maxPairMass");
   respectTrackOrder_ =
       iConfig.existsAs<bool>("respectTrackOrder") ? iConfig.getParameter<bool>("respectTrackOrder") : false;
+  useDstarTriplets_ =
+      iConfig.existsAs<bool>("useDstarTriplets") ? iConfig.getParameter<bool>("useDstarTriplets") : false;
+  enforceUniqueTracks_ =
+      iConfig.existsAs<bool>("enforceUniqueTracks") ? iConfig.getParameter<bool>("enforceUniqueTracks") : false;
+  writeLegacyBranches_ =
+      iConfig.existsAs<bool>("writeLegacyBranches") ? iConfig.getParameter<bool>("writeLegacyBranches") : true;
+  dstIsoCone_ = iConfig.existsAs<double>("dstIsoCone") ? iConfig.getParameter<double>("dstIsoCone") : 0.4;
+  useSoftPionCvh_ = iConfig.existsAs<bool>("useSoftPionCvh") ? iConfig.getParameter<bool>("useSoftPionCvh") : false;
+  saveGenParticles_ = iConfig.existsAs<bool>("saveGenParticles") ? iConfig.getParameter<bool>("saveGenParticles") : false;
+  fillTruthMatchOnCvhFailure_ = iConfig.getParameter<bool>("fillTruthMatchOnCvhFailure");
+  const edm::InputTag vertices =
+      iConfig.existsAs<edm::InputTag>("vertices") ? iConfig.getParameter<edm::InputTag>("vertices")
+                                                  : edm::InputTag("offlinePrimaryVertices");
+  vertexToken_ = consumes<reco::VertexCollection>(vertices);
+  if (saveGenParticles_) {
+    genParticlesForTreeToken_ = consumes<edm::View<reco::Candidate>>(iConfig.getParameter<edm::InputTag>("genParticles"));
+  }
+  if (useSoftPionCvh_) {
+    softPionCvhPtToken_ = consumes<edm::ValueMap<float>>(iConfig.getParameter<edm::InputTag>("softPionCvhPt"));
+    softPionCvhEtaToken_ = consumes<edm::ValueMap<float>>(iConfig.getParameter<edm::InputTag>("softPionCvhEta"));
+    softPionCvhPhiToken_ = consumes<edm::ValueMap<float>>(iConfig.getParameter<edm::InputTag>("softPionCvhPhi"));
+    softPionCvhChargeToken_ = consumes<edm::ValueMap<int>>(iConfig.getParameter<edm::InputTag>("softPionCvhCharge"));
+    softPionCvhEdmvalToken_ = consumes<edm::ValueMap<float>>(iConfig.getParameter<edm::InputTag>("softPionCvhEdmval"));
+    softPionCvhMomCovToken_ = consumes<edm::ValueMap<std::vector<float>>>(iConfig.getParameter<edm::InputTag>("softPionCvhMomCov"));
+  }
 
   doL1Trigger_ = iConfig.existsAs<bool>("doL1Trigger") ? iConfig.getParameter<bool>("doL1Trigger") : false;
   if (doL1Trigger_) {
@@ -253,11 +894,303 @@ ResidualGlobalCorrectionMakerTwoTrackKPiG4e::ResidualGlobalCorrectionMakerTwoTra
   }
 }
 
+void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::resetDstCandidateBranches() {
+  nParms = 0;
+  globalidxvfinal.clear();
+  K_jacRef.clear();
+  pi_jacRef.clear();
+  D0_jacMass.clear();
+  D0_jacobianValid = false;
+  D0_jacobianSchemaVersion = 1;
+
+  raw_D0_mass = -99.;
+  raw_Dst_mass = -99.;
+  raw_DeltaM = -99.;
+  Dst_pt = -99.;
+  Dst_eta = -99.;
+  Dst_phi = -99.;
+  Dst_iso = -99.;
+  pis_dR_D0raw = -99.;
+  cheapCA_Kpi_dxy = -99.;
+  cheapCA_Kpi_zAtCA = -99.;
+  cheapCA_Kpi_3d = -99.;
+  cheapCA_D0pis_dxy = -99.;
+  cheapCA_D0pis_zAtCA = -99.;
+  cheapCA_D0pis_3d = -99.;
+
+  chi2_piK = -99.;
+  pval_piK = -99.;
+  mass_piK = -99.;
+  D0_fit_mass = -99.;
+  cos_D0_PV = -99.;
+  cosT_D0_PV = -99.;
+  d_vtxD0_PV = -99.;
+  sigd_vtxD0_PV = -99.;
+  dxy_vtxD0_BS = -99.;
+  sigdxy_vtxD0_BS = -99.;
+  chi2_D0pis = -99.;
+  pval_D0pis = -99.;
+  mass_D0pis = -99.;
+  deltaM_D0pis_piK = -99.;
+  Dst_fit_mass = -99.;
+  Dst_fit_deltaM = -99.;
+  cos_Dst_PV = -99.;
+  cosT_Dst_PV = -99.;
+  d_vtxDst_PV = -99.;
+  sigd_vtxDst_PV = -99.;
+  dxy_vtxDst_PV = -99.;
+  sigdxy_vtxDst_PV = -99.;
+  Dst_sumPtCone04 = -99.;
+  pis_dR_D0 = -99.;
+
+  K_charge = 0;
+  pi_charge = 0;
+  pis_charge = 0;
+  K_pt = -99.;
+  K_eta = -99.;
+  K_phi = -99.;
+  pi_pt = -99.;
+  pi_eta = -99.;
+  pi_phi = -99.;
+  pis_pt = -99.;
+  pis_eta = -99.;
+  pis_phi = -99.;
+  K_dxy_BS = -99.;
+  K_sigdxy_BS = -99.;
+  K_dz_BS = -99.;
+  K_sigdz_BS = -99.;
+  K_dxy_PV = -99.;
+  K_sigdxy_PV = -99.;
+  K_dz_PV = -99.;
+  K_sigdz_PV = -99.;
+  pi_dxy_BS = -99.;
+  pi_sigdxy_BS = -99.;
+  pi_dz_BS = -99.;
+  pi_sigdz_BS = -99.;
+  pi_dxy_PV = -99.;
+  pi_sigdxy_PV = -99.;
+  pi_dz_PV = -99.;
+  pi_sigdz_PV = -99.;
+  pis_dxy_BS = -99.;
+  pis_sigdxy_BS = -99.;
+  pis_dz_BS = -99.;
+  pis_sigdz_BS = -99.;
+  pis_dxy_PV = -99.;
+  pis_sigdxy_PV = -99.;
+  pis_dz_PV = -99.;
+  pis_sigdz_PV = -99.;
+
+  D0_raw_pt = -99.;
+  D0_raw_eta = -99.;
+  D0_raw_phi = -99.;
+  D0_CVH_d = -99.;
+  D0_CVH_x = -99.;
+  D0_CVH_y = -99.;
+  D0_CVH_z = -99.;
+  D0_CVH_pt = -99.;
+  D0_CVH_eta = -99.;
+  D0_CVH_phi = -99.;
+  D0_CVH_mass = -99.;
+  D0_CVH_sigmaMass = -99.;
+  D0_CVH_edmval = -99.;
+  D0_CVH_niter = -1;
+  D0_CVH_valid = false;
+  D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kCandidatePrecondition);
+  K_CVH_pt = -99.;
+  K_CVH_eta = -99.;
+  K_CVH_phi = -99.;
+  K_CVH_dxy_BS = -99.;
+  K_CVH_sigdxy_BS = -99.;
+  K_CVH_dz_BS = -99.;
+  K_CVH_sigdz_BS = -99.;
+  K_CVH_dxy_PV = -99.;
+  K_CVH_sigdxy_PV = -99.;
+  K_CVH_dz_PV = -99.;
+  K_CVH_sigdz_PV = -99.;
+  pi_CVH_pt = -99.;
+  pi_CVH_eta = -99.;
+  pi_CVH_phi = -99.;
+  pi_CVH_dxy_BS = -99.;
+  pi_CVH_sigdxy_BS = -99.;
+  pi_CVH_dz_BS = -99.;
+  pi_CVH_sigdz_BS = -99.;
+  pi_CVH_dxy_PV = -99.;
+  pi_CVH_sigdxy_PV = -99.;
+  pi_CVH_dz_PV = -99.;
+  pi_CVH_sigdz_PV = -99.;
+  pis_CVH_pt = -99.;
+  pis_CVH_eta = -99.;
+  pis_CVH_phi = -99.;
+  pis_CVH_charge = 0;
+  pis_CVH_edmval = -99.;
+  pis_CVH_dxy_BS = -99.;
+  pis_CVH_sigdxy_BS = -99.;
+  pis_CVH_dz_BS = -99.;
+  pis_CVH_sigdz_BS = -99.;
+  pis_CVH_dxy_PV = -99.;
+  pis_CVH_sigdxy_PV = -99.;
+  pis_CVH_dz_PV = -99.;
+  pis_CVH_sigdz_PV = -99.;
+  Dst_CVH_mass = -99.;
+  Dst_CVH_deltaM = -99.;
+  Dst_CVH3_mass = -99.;
+  Dst_CVH3_deltaM = -99.;
+}
+
 void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::beginStream(edm::StreamID streamid)
 {
   ResidualGlobalCorrectionMakerBase::beginStream(streamid);
   
   if (fillTrackTree_) {
+    // In append mode, keep every CVH value distinguishable from the
+    // transient-producer branches already stored in the shared tree.
+    TTreeBranchProxy tree(this->tree, appendToTFileService_);
+    tree->Branch("raw_D0_mass", &raw_D0_mass);
+    tree->Branch("raw_Dst_mass", &raw_Dst_mass);
+    tree->Branch("raw_DeltaM", &raw_DeltaM);
+    tree->Branch("Dst_pt", &Dst_pt);
+    tree->Branch("Dst_eta", &Dst_eta);
+    tree->Branch("Dst_phi", &Dst_phi);
+    tree->Branch("Dst_iso", &Dst_iso);
+    tree->Branch("pis_dR_D0raw", &pis_dR_D0raw);
+    tree->Branch("cheapCA_Kpi_dxy", &cheapCA_Kpi_dxy);
+    tree->Branch("cheapCA_Kpi_zAtCA", &cheapCA_Kpi_zAtCA);
+    tree->Branch("cheapCA_Kpi_3d", &cheapCA_Kpi_3d);
+    tree->Branch("cheapCA_D0pis_dxy", &cheapCA_D0pis_dxy);
+    tree->Branch("cheapCA_D0pis_zAtCA", &cheapCA_D0pis_zAtCA);
+    tree->Branch("cheapCA_D0pis_3d", &cheapCA_D0pis_3d);
+    tree->Branch("chi2_piK", &chi2_piK);
+    tree->Branch("pval_piK", &pval_piK);
+    tree->Branch("mass_piK", &mass_piK);
+    tree->Branch("D0_fit_mass", &D0_fit_mass);
+    tree->Branch("cos_D0_PV", &cos_D0_PV);
+    tree->Branch("cosT_D0_PV", &cosT_D0_PV);
+    tree->Branch("d_vtxD0_PV", &d_vtxD0_PV);
+    tree->Branch("sigd_vtxD0_PV", &sigd_vtxD0_PV);
+    tree->Branch("dxy_vtxD0_BS", &dxy_vtxD0_BS);
+    tree->Branch("sigdxy_vtxD0_BS", &sigdxy_vtxD0_BS);
+    tree->Branch("chi2_D0pis", &chi2_D0pis);
+    tree->Branch("pval_D0pis", &pval_D0pis);
+    tree->Branch("mass_D0pis", &mass_D0pis);
+    tree->Branch("deltaM_D0pis_piK", &deltaM_D0pis_piK);
+    tree->Branch("Dst_fit_mass", &Dst_fit_mass);
+    tree->Branch("Dst_fit_deltaM", &Dst_fit_deltaM);
+    tree->Branch("cos_Dst_PV", &cos_Dst_PV);
+    tree->Branch("cosT_Dst_PV", &cosT_Dst_PV);
+    tree->Branch("d_vtxDst_PV", &d_vtxDst_PV);
+    tree->Branch("sigd_vtxDst_PV", &sigd_vtxDst_PV);
+    tree->Branch("dxy_vtxDst_PV", &dxy_vtxDst_PV);
+    tree->Branch("sigdxy_vtxDst_PV", &sigdxy_vtxDst_PV);
+    tree->Branch("Dst_sumPtCone04", &Dst_sumPtCone04);
+    tree->Branch("pis_dR_D0", &pis_dR_D0);
+
+    tree->Branch("K_charge", &K_charge);
+    tree->Branch("K_pt", &K_pt);
+    tree->Branch("K_eta", &K_eta);
+    tree->Branch("K_phi", &K_phi);
+    tree->Branch("pi_charge", &pi_charge);
+    tree->Branch("pi_pt", &pi_pt);
+    tree->Branch("pi_eta", &pi_eta);
+    tree->Branch("pi_phi", &pi_phi);
+    tree->Branch("pis_charge", &pis_charge);
+    tree->Branch("pis_pt", &pis_pt);
+    tree->Branch("pis_eta", &pis_eta);
+    tree->Branch("pis_phi", &pis_phi);
+    tree->Branch("K_dxy_BS", &K_dxy_BS);
+    tree->Branch("K_sigdxy_BS", &K_sigdxy_BS);
+    tree->Branch("K_dz_BS", &K_dz_BS);
+    tree->Branch("K_sigdz_BS", &K_sigdz_BS);
+    tree->Branch("K_dxy_PV", &K_dxy_PV);
+    tree->Branch("K_sigdxy_PV", &K_sigdxy_PV);
+    tree->Branch("K_dz_PV", &K_dz_PV);
+    tree->Branch("K_sigdz_PV", &K_sigdz_PV);
+    tree->Branch("pi_dxy_BS", &pi_dxy_BS);
+    tree->Branch("pi_sigdxy_BS", &pi_sigdxy_BS);
+    tree->Branch("pi_dz_BS", &pi_dz_BS);
+    tree->Branch("pi_sigdz_BS", &pi_sigdz_BS);
+    tree->Branch("pi_dxy_PV", &pi_dxy_PV);
+    tree->Branch("pi_sigdxy_PV", &pi_sigdxy_PV);
+    tree->Branch("pi_dz_PV", &pi_dz_PV);
+    tree->Branch("pi_sigdz_PV", &pi_sigdz_PV);
+    tree->Branch("pis_dxy_BS", &pis_dxy_BS);
+    tree->Branch("pis_sigdxy_BS", &pis_sigdxy_BS);
+    tree->Branch("pis_dz_BS", &pis_dz_BS);
+    tree->Branch("pis_sigdz_BS", &pis_sigdz_BS);
+    tree->Branch("pis_dxy_PV", &pis_dxy_PV);
+    tree->Branch("pis_sigdxy_PV", &pis_sigdxy_PV);
+    tree->Branch("pis_dz_PV", &pis_dz_PV);
+    tree->Branch("pis_sigdz_PV", &pis_sigdz_PV);
+
+    tree->Branch("D0_raw_pt", &D0_raw_pt);
+    tree->Branch("D0_raw_eta", &D0_raw_eta);
+    tree->Branch("D0_raw_phi", &D0_raw_phi);
+    tree->Branch("D0_CVH_d", &D0_CVH_d);
+    tree->Branch("D0_CVH_x", &D0_CVH_x);
+    tree->Branch("D0_CVH_y", &D0_CVH_y);
+    tree->Branch("D0_CVH_z", &D0_CVH_z);
+    tree->Branch("D0_CVH_pt", &D0_CVH_pt);
+    tree->Branch("D0_CVH_eta", &D0_CVH_eta);
+    tree->Branch("D0_CVH_phi", &D0_CVH_phi);
+    tree->Branch("D0_CVH_mass", &D0_CVH_mass);
+    tree->Branch("D0_CVH_sigmaMass", &D0_CVH_sigmaMass);
+    tree->Branch("D0_CVH_edmval", &D0_CVH_edmval);
+    tree->Branch("D0_CVH_niter", &D0_CVH_niter);
+    tree->Branch("D0_CVH_valid", &D0_CVH_valid);
+    tree->Branch("D0_CVH_failureCode", &D0_CVH_failureCode);
+    tree->Branch("K_CVH_pt", &K_CVH_pt);
+    tree->Branch("K_CVH_eta", &K_CVH_eta);
+    tree->Branch("K_CVH_phi", &K_CVH_phi);
+    tree->Branch("K_CVH_dxy_BS", &K_CVH_dxy_BS);
+    tree->Branch("K_CVH_sigdxy_BS", &K_CVH_sigdxy_BS);
+    tree->Branch("K_CVH_dz_BS", &K_CVH_dz_BS);
+    tree->Branch("K_CVH_sigdz_BS", &K_CVH_sigdz_BS);
+    tree->Branch("K_CVH_dxy_PV", &K_CVH_dxy_PV);
+    tree->Branch("K_CVH_sigdxy_PV", &K_CVH_sigdxy_PV);
+    tree->Branch("K_CVH_dz_PV", &K_CVH_dz_PV);
+    tree->Branch("K_CVH_sigdz_PV", &K_CVH_sigdz_PV);
+    tree->Branch("pi_CVH_pt", &pi_CVH_pt);
+    tree->Branch("pi_CVH_eta", &pi_CVH_eta);
+    tree->Branch("pi_CVH_phi", &pi_CVH_phi);
+    tree->Branch("pi_CVH_dxy_BS", &pi_CVH_dxy_BS);
+    tree->Branch("pi_CVH_sigdxy_BS", &pi_CVH_sigdxy_BS);
+    tree->Branch("pi_CVH_dz_BS", &pi_CVH_dz_BS);
+    tree->Branch("pi_CVH_sigdz_BS", &pi_CVH_sigdz_BS);
+    tree->Branch("pi_CVH_dxy_PV", &pi_CVH_dxy_PV);
+    tree->Branch("pi_CVH_sigdxy_PV", &pi_CVH_sigdxy_PV);
+    tree->Branch("pi_CVH_dz_PV", &pi_CVH_dz_PV);
+    tree->Branch("pi_CVH_sigdz_PV", &pi_CVH_sigdz_PV);
+    tree->Branch("pis_CVH_pt", &pis_CVH_pt);
+    tree->Branch("pis_CVH_eta", &pis_CVH_eta);
+    tree->Branch("pis_CVH_phi", &pis_CVH_phi);
+    tree->Branch("pis_CVH_charge", &pis_CVH_charge);
+    tree->Branch("pis_CVH_edmval", &pis_CVH_edmval);
+    tree->Branch("pis_CVH_dxy_BS", &pis_CVH_dxy_BS);
+    tree->Branch("pis_CVH_sigdxy_BS", &pis_CVH_sigdxy_BS);
+    tree->Branch("pis_CVH_dz_BS", &pis_CVH_dz_BS);
+    tree->Branch("pis_CVH_sigdz_BS", &pis_CVH_sigdz_BS);
+    tree->Branch("pis_CVH_dxy_PV", &pis_CVH_dxy_PV);
+    tree->Branch("pis_CVH_sigdxy_PV", &pis_CVH_sigdxy_PV);
+    tree->Branch("pis_CVH_dz_PV", &pis_CVH_dz_PV);
+    tree->Branch("pis_CVH_sigdz_PV", &pis_CVH_sigdz_PV);
+    tree->Branch("Dst_CVH_mass", &Dst_CVH_mass);
+    tree->Branch("Dst_CVH_deltaM", &Dst_CVH_deltaM);
+    tree->Branch("Dst_CVH3_mass", &Dst_CVH3_mass);
+    tree->Branch("Dst_CVH3_deltaM", &Dst_CVH3_deltaM);
+
+    tree->Branch("gen_pdgId", &gen_pdgId);
+    tree->Branch("gen_status", &gen_status);
+    tree->Branch("gen_charge", &gen_charge);
+    tree->Branch("gen_motherPdgId", &gen_motherPdgId);
+    tree->Branch("gen_grandmotherPdgId", &gen_grandmotherPdgId);
+    tree->Branch("gen_pt", &gen_pt);
+    tree->Branch("gen_eta", &gen_eta);
+    tree->Branch("gen_phi", &gen_phi);
+    tree->Branch("gen_mass", &gen_mass);
+    tree->Branch("gen_vx", &gen_vx);
+    tree->Branch("gen_vy", &gen_vy);
+    tree->Branch("gen_vz", &gen_vz);
+
+  if (writeLegacyBranches_) {
     tree->Branch("Jpsi_d", &Jpsi_d);
     tree->Branch("Jpsi_x", &Jpsi_x);
     tree->Branch("Jpsi_y", &Jpsi_y);
@@ -409,6 +1342,19 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::beginStream(edm::StreamID stre
     tree->Branch("dinvmasssqconvval", &dinvmasssqconvval);
     tree->Branch("dmassconvval_cons0", &dmassconvval_cons0);
     tree->Branch("dinvmasssqconvval_cons0", &dinvmasssqconvval_cons0);
+  }
+
+    if (fillJac_) {
+      tree->Branch("K_jacRef", &K_jacRef);
+      tree->Branch("pi_jacRef", &pi_jacRef);
+      tree->Branch("D0_jacMass", &D0_jacMass);
+      if (appendToTFileService_) {
+        tree->Branch("nParms", &nParms);
+        tree->Branch("globalidxv", &globalidxvfinal);
+      }
+      tree->Branch("D0_jacobianValid", &D0_jacobianValid);
+      tree->Branch("D0_jacobianSchemaVersion", &D0_jacobianSchemaVersion);
+    }
 
     for (std::size_t itrig = 0; itrig < l1Triggers_.size(); ++itrig) {
       tree->Branch(l1Triggers_[itrig].c_str(), &l1TriggerDecisions_[itrig]);
@@ -432,6 +1378,69 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 
   Handle<reco::TrackCollection> trackOrigH;
   iEvent.getByToken(inputTrackOrig_, trackOrigH);
+
+  edm::Handle<edm::ValueMap<float>> softPionCvhPt;
+  edm::Handle<edm::ValueMap<float>> softPionCvhEta;
+  edm::Handle<edm::ValueMap<float>> softPionCvhPhi;
+  edm::Handle<edm::ValueMap<int>> softPionCvhCharge;
+  edm::Handle<edm::ValueMap<float>> softPionCvhEdmval;
+  edm::Handle<edm::ValueMap<std::vector<float>>> softPionCvhMomCov;
+  if (useSoftPionCvh_) {
+    iEvent.getByToken(softPionCvhPtToken_, softPionCvhPt);
+    iEvent.getByToken(softPionCvhEtaToken_, softPionCvhEta);
+    iEvent.getByToken(softPionCvhPhiToken_, softPionCvhPhi);
+    iEvent.getByToken(softPionCvhChargeToken_, softPionCvhCharge);
+    iEvent.getByToken(softPionCvhEdmvalToken_, softPionCvhEdmval);
+    iEvent.getByToken(softPionCvhMomCovToken_, softPionCvhMomCov);
+  }
+
+  gen_pdgId.clear();
+  gen_status.clear();
+  gen_charge.clear();
+  gen_motherPdgId.clear();
+  gen_grandmotherPdgId.clear();
+  gen_pt.clear();
+  gen_eta.clear();
+  gen_phi.clear();
+  gen_mass.clear();
+  gen_vx.clear();
+  gen_vy.clear();
+  gen_vz.clear();
+  if (saveGenParticles_) {
+    edm::Handle<edm::View<reco::Candidate>> genParticlesForTree;
+    iEvent.getByToken(genParticlesForTreeToken_, genParticlesForTree);
+    if (genParticlesForTree.isValid()) {
+      gen_pdgId.reserve(genParticlesForTree->size());
+      gen_status.reserve(genParticlesForTree->size());
+      gen_charge.reserve(genParticlesForTree->size());
+      gen_motherPdgId.reserve(genParticlesForTree->size());
+      gen_grandmotherPdgId.reserve(genParticlesForTree->size());
+      gen_pt.reserve(genParticlesForTree->size());
+      gen_eta.reserve(genParticlesForTree->size());
+      gen_phi.reserve(genParticlesForTree->size());
+      gen_mass.reserve(genParticlesForTree->size());
+      gen_vx.reserve(genParticlesForTree->size());
+      gen_vy.reserve(genParticlesForTree->size());
+      gen_vz.reserve(genParticlesForTree->size());
+      for (auto const& gen : *genParticlesForTree) {
+        const reco::Candidate* mother = gen.numberOfMothers() > 0 ? gen.mother(0) : nullptr;
+        const reco::Candidate* grandmother =
+            mother != nullptr && mother->numberOfMothers() > 0 ? mother->mother(0) : nullptr;
+        gen_pdgId.push_back(gen.pdgId());
+        gen_status.push_back(gen.status());
+        gen_charge.push_back(gen.charge());
+        gen_motherPdgId.push_back(mother != nullptr ? mother->pdgId() : 0);
+        gen_grandmotherPdgId.push_back(grandmother != nullptr ? grandmother->pdgId() : 0);
+        gen_pt.push_back(gen.pt());
+        gen_eta.push_back(gen.eta());
+        gen_phi.push_back(gen.phi());
+        gen_mass.push_back(gen.mass());
+        gen_vx.push_back(gen.vx());
+        gen_vy.push_back(gen.vy());
+        gen_vz.push_back(gen.vz());
+      }
+    }
+  }
 
 
   // loop over gen particles
@@ -499,6 +1508,21 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 
   Handle<reco::BeamSpot> bsH;
   iEvent.getByToken(inputBs_, bsH);
+
+  edm::Handle<reco::VertexCollection> vertices;
+  iEvent.getByToken(vertexToken_, vertices);
+  const reco::Vertex* primaryVertex = nullptr;
+  if (vertices.isValid()) {
+    for (const auto& vertex : *vertices) {
+      if (!vertex.isFake() && vertex.ndof() > 4.) {
+        primaryVertex = &vertex;
+        break;
+      }
+    }
+    if (primaryVertex == nullptr && !vertices->empty()) {
+      primaryVertex = &vertices->front();
+    }
+  }
   
   const std::array<double, 2> trackMass = {{kaonMass_, pionMass_}};
   const std::array<double, 2> trackMassErr = {{kaonMassErr_, pionMassErr_}};
@@ -512,7 +1536,7 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
   VectorXd grad;
   MatrixXd hess;
   LDLT<MatrixXd> Cinvd;
-//   MatrixXd covstate;
+  MatrixXd covstate;
   Matrix<double, 6, 6> covrefmom;
 //   FullPivLU<MatrixXd> Cinvd;
 //   ColPivHouseholderQR<MatrixXd> Cinvd;
@@ -523,9 +1547,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
   lumi = iEvent.luminosityBlock();
   event = iEvent.id().event();
 
-  const bool useFixedPairOrder = respectTrackOrder_ && trackOrigH->size() >= 2;
-  const auto firstTrack = trackOrigH->begin();
-  const auto secondTrack = useFixedPairOrder ? std::next(trackOrigH->begin()) : trackOrigH->end();
+  const bool useOrderedConsecutivePairs = respectTrackOrder_ && trackOrigH->size() >= 2;
+  const unsigned int orderedStride = useDstarTriplets_ ? 3 : 2;
+  std::unordered_set<unsigned int> usedTrackIndices;
 
   genweight = 1.;
   if (doGen_) {
@@ -662,9 +1686,21 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
   
   // loop over combinatorics of track pairs
   for (auto itrack = trackOrigH->begin(); itrack != trackOrigH->end(); ++itrack) {
-    if (useFixedPairOrder && itrack != firstTrack) {
-      break;
+    const auto itrackIndex = static_cast<unsigned int>(std::distance(trackOrigH->begin(), itrack));
+    if (useOrderedConsecutivePairs) {
+      if ((itrackIndex % orderedStride) != 0) {
+        continue;
+      }
+      if (itrackIndex + orderedStride - 1 >= trackOrigH->size()) {
+        continue;
+      }
     }
+    const bool preserveTruthMatch =
+        fillTruthMatchOnCvhFailure_ && fillTrackTree_ && useOrderedConsecutivePairs && useDstarTriplets_;
+    if (preserveTruthMatch) {
+      resetDstCandidateBranches();
+    }
+    DstCandidateFillGuard truthMatchFillGuard(tree, preserveTruthMatch);
     if (itrack->isLooper()) {
       continue;
     }
@@ -712,13 +1748,32 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
     }
 
     for (auto jtrack = trackOrigH->begin(); jtrack != trackOrigH->end(); ++jtrack) {
-      if (useFixedPairOrder && jtrack != secondTrack) {
+      const auto jtrackIndex = static_cast<unsigned int>(std::distance(trackOrigH->begin(), jtrack));
+      if (useOrderedConsecutivePairs &&
+          jtrackIndex != itrackIndex + 1) {
         continue;
       }
       if (jtrack == itrack) {
         continue;
       }
+      const reco::Track* softPionTrack = nullptr;
+      unsigned int softPionIndex = std::numeric_limits<unsigned int>::max();
+      if (useDstarTriplets_) {
+        softPionIndex = itrackIndex + 2;
+        softPionTrack = &trackOrigH->at(softPionIndex);
+        if (enforceUniqueTracks_ &&
+            (usedTrackIndices.count(itrackIndex) || usedTrackIndices.count(jtrackIndex) ||
+             usedTrackIndices.count(softPionIndex))) {
+          continue;
+        }
+      } else if (enforceUniqueTracks_ &&
+                 (usedTrackIndices.count(itrackIndex) || usedTrackIndices.count(jtrackIndex))) {
+        continue;
+      }
       if (jtrack->isLooper()) {
+        continue;
+      }
+      if (softPionTrack != nullptr && softPionTrack->isLooper()) {
         continue;
       }
       
@@ -731,8 +1786,181 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
       mutrkarr[1] = ROOT::Math::PxPyPzMVector(jtrack->px(), jtrack->py(), jtrack->pz(), trackMass[1]);
 
       const double rawPairMass = (mutrkarr[0] + mutrkarr[1]).mass();
-      if (rawPairMass < minPairMass_ || rawPairMass > maxPairMass_) {
+      // Negative bounds disable this optional diagnostic preselection.  This
+      // lets an upstream transient-fit producer define the accepted triplets.
+      if ((minPairMass_ >= 0. && rawPairMass < minPairMass_) ||
+          (maxPairMass_ >= 0. && rawPairMass > maxPairMass_)) {
         continue;
+      }
+
+      const auto rawD0P4 = mutrkarr[0] + mutrkarr[1];
+      raw_D0_mass = rawPairMass;
+      raw_Dst_mass = -99.;
+      raw_DeltaM = -99.;
+      Dst_pt = -99.;
+      Dst_eta = -99.;
+      Dst_phi = -99.;
+      Dst_iso = -99.;
+      pis_dR_D0raw = -99.;
+      cheapCA_Kpi_dxy = -99.;
+      cheapCA_Kpi_zAtCA = -99.;
+      cheapCA_Kpi_3d = -99.;
+      cheapCA_D0pis_dxy = -99.;
+      cheapCA_D0pis_zAtCA = -99.;
+      cheapCA_D0pis_3d = -99.;
+      D0_raw_pt = rawD0P4.pt();
+      D0_raw_eta = rawD0P4.eta();
+      D0_raw_phi = rawD0P4.phi();
+      K_charge = itrack->charge();
+      K_pt = itrack->pt();
+      K_eta = itrack->eta();
+      K_phi = itrack->phi();
+      pi_charge = jtrack->charge();
+      pi_pt = jtrack->pt();
+      pi_eta = jtrack->eta();
+      pi_phi = jtrack->phi();
+      pis_charge = 0;
+      pis_pt = -99.;
+      pis_eta = -99.;
+      pis_phi = -99.;
+      K_dxy_BS = -99.;
+      K_sigdxy_BS = -99.;
+      K_dz_BS = -99.;
+      K_sigdz_BS = -99.;
+      K_dxy_PV = -99.;
+      K_sigdxy_PV = -99.;
+      K_dz_PV = -99.;
+      K_sigdz_PV = -99.;
+      pi_dxy_BS = -99.;
+      pi_sigdxy_BS = -99.;
+      pi_dz_BS = -99.;
+      pi_sigdz_BS = -99.;
+      pi_dxy_PV = -99.;
+      pi_sigdxy_PV = -99.;
+      pi_dz_PV = -99.;
+      pi_sigdz_PV = -99.;
+      pis_dxy_BS = -99.;
+      pis_sigdxy_BS = -99.;
+      pis_dz_BS = -99.;
+      pis_sigdz_BS = -99.;
+      pis_dxy_PV = -99.;
+      pis_sigdxy_PV = -99.;
+      pis_dz_PV = -99.;
+      pis_sigdz_PV = -99.;
+
+      const auto fillTrackImpactParameters = [&](const reco::Track& track,
+                                                 float& dxyBS,
+                                                 float& sigdxyBS,
+                                                 float& dzBS,
+                                                 float& sigdzBS,
+                                                 float& dxyPV,
+                                                 float& sigdxyPV,
+                                                 float& dzPV,
+                                                 float& sigdzPV) {
+        if (bsH.isValid()) {
+          dxyBS = track.dxy(bsH->position());
+          sigdxyBS = dstSignedValueSignificance(dxyBS, track.dxyError());
+          dzBS = track.dz(bsH->position());
+          sigdzBS = dstSignedValueSignificance(dzBS, track.dzError());
+        }
+        if (primaryVertex != nullptr) {
+          dxyPV = track.dxy(primaryVertex->position());
+          sigdxyPV = dstSignedValueSignificance(dxyPV, track.dxyError());
+          dzPV = track.dz(primaryVertex->position());
+          sigdzPV = dstSignedValueSignificance(dzPV, track.dzError());
+        }
+      };
+
+      fillTrackImpactParameters(*itrack,
+                                K_dxy_BS,
+                                K_sigdxy_BS,
+                                K_dz_BS,
+                                K_sigdz_BS,
+                                K_dxy_PV,
+                                K_sigdxy_PV,
+                                K_dz_PV,
+                                K_sigdz_PV);
+      fillTrackImpactParameters(*jtrack,
+                                pi_dxy_BS,
+                                pi_sigdxy_BS,
+                                pi_dz_BS,
+                                pi_sigdz_BS,
+                                pi_dxy_PV,
+                                pi_sigdxy_PV,
+                                pi_dz_PV,
+                                pi_sigdz_PV);
+
+      const DstCheapCAResult kpiCA = dstCheapClosestApproachXY(makeDstCheapLine(*itrack), makeDstCheapLine(*jtrack));
+      cheapCA_Kpi_dxy = kpiCA.dxy;
+      cheapCA_Kpi_zAtCA = kpiCA.dz;
+      cheapCA_Kpi_3d = kpiCA.dist3d;
+      chi2_piK = -99.;
+      pval_piK = -99.;
+      mass_piK = -99.;
+      D0_fit_mass = -99.;
+      cos_D0_PV = -99.;
+      cosT_D0_PV = -99.;
+      d_vtxD0_PV = -99.;
+      sigd_vtxD0_PV = -99.;
+      dxy_vtxD0_BS = -99.;
+      sigdxy_vtxD0_BS = -99.;
+      chi2_D0pis = -99.;
+      pval_D0pis = -99.;
+      mass_D0pis = -99.;
+      deltaM_D0pis_piK = -99.;
+      Dst_fit_mass = -99.;
+      Dst_fit_deltaM = -99.;
+      cos_Dst_PV = -99.;
+      cosT_Dst_PV = -99.;
+      d_vtxDst_PV = -99.;
+      sigd_vtxDst_PV = -99.;
+      dxy_vtxDst_PV = -99.;
+      sigdxy_vtxDst_PV = -99.;
+      Dst_sumPtCone04 = -99.;
+      pis_dR_D0 = -99.;
+      if (softPionTrack != nullptr) {
+        const auto rawPisP4 = dstTrackP4(*softPionTrack, softPionMass_);
+        const auto rawDstP4 = rawD0P4 + rawPisP4;
+        raw_Dst_mass = rawDstP4.mass();
+        raw_DeltaM = rawDstP4.mass() - rawD0P4.mass();
+        Dst_pt = rawDstP4.pt();
+        Dst_eta = rawDstP4.eta();
+        Dst_phi = rawDstP4.phi();
+        pis_dR_D0raw = dstDeltaR(softPionTrack->eta(), softPionTrack->phi(), rawD0P4.eta(), rawD0P4.phi());
+        pis_charge = softPionTrack->charge();
+        pis_pt = softPionTrack->pt();
+        pis_eta = softPionTrack->eta();
+        pis_phi = softPionTrack->phi();
+        fillTrackImpactParameters(*softPionTrack,
+                                  pis_dxy_BS,
+                                  pis_sigdxy_BS,
+                                  pis_dz_BS,
+                                  pis_sigdz_BS,
+                                  pis_dxy_PV,
+                                  pis_sigdxy_PV,
+                                  pis_dz_PV,
+                                  pis_sigdz_PV);
+
+        double scalarPtInCone = 0.;
+        for (unsigned int itk = 0; itk < trackOrigH->size(); ++itk) {
+          if (itk == itrackIndex || itk == jtrackIndex || itk == softPionIndex) {
+            continue;
+          }
+          const auto& isoTrack = trackOrigH->at(itk);
+          if (dstDeltaR(isoTrack.eta(), isoTrack.phi(), rawDstP4.eta(), rawDstP4.phi()) < dstIsoCone_) {
+            scalarPtInCone += isoTrack.pt();
+          }
+        }
+        Dst_sumPtCone04 = scalarPtInCone;
+        Dst_iso = rawDstP4.pt() / (rawDstP4.pt() + scalarPtInCone);
+        pis_dR_D0 = pis_dR_D0raw;
+
+        const DstCheapLine d0Line =
+            makeDstCheapLine(kpiCA.midX, kpiCA.midY, kpiCA.midZ, rawD0P4.px(), rawD0P4.py(), rawD0P4.pz());
+        const DstCheapCAResult d0PisCA = dstCheapClosestApproachXY(d0Line, makeDstCheapLine(*softPionTrack));
+        cheapCA_D0pis_dxy = d0PisCA.dxy;
+        cheapCA_D0pis_zAtCA = d0PisCA.dz;
+        cheapCA_D0pis_3d = d0PisCA.dist3d;
       }
       
 
@@ -996,6 +2224,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
       }
 
       if (nhitsarr[0] == 0 || nhitsarr[1] == 0) {
+        if (preserveTruthMatch) {
+          D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kNoUsableTrackerHits);
+        }
         continue;
       }
       
@@ -1034,6 +2265,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 //       const unsigned int nicons = doMassConstraint_ ? 3 : 1;
       
       for (unsigned int icons = 0; icons < nicons; ++icons) {
+        if (preserveTruthMatch) {
+          D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kKinematicFit);
+        }
         
 
         // common vertex fit
@@ -1064,6 +2298,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
           std::cout << "Abort: invalid kinematic fit!\n";
           valid = false;
           break;
+        }
+        if (preserveTruthMatch) {
+          D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kG4eFit);
         }
         
         kinTree->movePointerToTheTop();
@@ -2238,7 +3475,7 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 //           std::cout << "Muminus pt, eta, phi = " << Muminus_pt << ", " << Muminus_eta << ", " << Muminus_phi << std::endl;
           
           
-          MatrixXd covstate =  2.*Cinvd.solve(MatrixXd::Identity(nstateparms,nstateparms));
+          covstate =  2.*Cinvd.solve(MatrixXd::Identity(nstateparms,nstateparms));
 
           covrefmom  = covstate.topLeftCorner<6, 6>();
 
@@ -2528,6 +3765,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
           if (std::isnan(edmval) || std::isinf(edmval)) {
             std::cout << "WARNING: invalid parameter update!!!" << " edmval = " << edmval << " deltachisqval = " << deltachisqval << std::endl;
             valid = false;
+            if (preserveTruthMatch) {
+              D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kNumericalFit);
+            }
             break;
           }
           
@@ -2633,17 +3873,67 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
           const unsigned int trackstateidxplus = 3*idxplus;
           const unsigned int trackstateidxminus = 3*idxminus;
 
+          const bool jacobianDimensionsConsistent =
+              dxdparms.rows() == nparsfinal &&
+              dxdparms.cols() >= 6;
+          if (fillJac_ && !jacobianDimensionsConsistent) {
+            std::cout << "WARNING: invalid D0 Jacobian dimensions" << std::endl;
+            valid = false;
+            if (preserveTruthMatch) {
+              D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kNumericalFit);
+            }
+            globalidxvfinal.clear();
+            nParms = 0;
+            break;
+          }
+
           Muplus_jacRef.resize(3*nparsfinal);
           Map<Matrix<float, 3, Dynamic, RowMajor>>(Muplus_jacRef.data(), 3, nparsfinal) = dxdparms.block(0, trackstateidxplus, nparsfinal, 3).transpose().cast<float>();
 
           Muminus_jacRef.resize(3*nparsfinal);
           Map<Matrix<float, 3, Dynamic, RowMajor>>(Muminus_jacRef.data(), 3, nparsfinal) = dxdparms.block(0, trackstateidxminus, nparsfinal, 3).transpose().cast<float>();
 
+          K_jacRef.resize(3*nparsfinal);
+          Map<Matrix<float, 3, Dynamic, RowMajor>>(K_jacRef.data(), 3, nparsfinal) =
+              dxdparms.block(0, 0, nparsfinal, 3).transpose().cast<float>();
+
+          pi_jacRef.resize(3*nparsfinal);
+          Map<Matrix<float, 3, Dynamic, RowMajor>>(pi_jacRef.data(), 3, nparsfinal) =
+              dxdparms.block(0, 3, nparsfinal, 3).transpose().cast<float>();
+
           const Matrix<double, 1, 6> mjacalt =
               massJacobianAltD(refftsarr[0], refftsarr[1], massForConstraintHelpers);
 
           Jpsi_jacMass.resize(nparsfinal);
           Map<Matrix<float, 1, Dynamic, RowMajor>>(Jpsi_jacMass.data(), 1, nparsfinal) = (mjacalt*dxdparms.leftCols<6>().transpose()).cast<float>();
+
+          const Matrix<double, 10, 1> fittedStatePca =
+              twoTrackCart2pca(refftsarr[0], refftsarr[1]) + dxfull.head<10>();
+          Matrix<double, 1, 6> d0MassJacobian;
+          const bool d0MassJacobianFinite =
+              dstD0MassJacobian(fittedStatePca, trackMass[0], trackMass[1], d0MassJacobian);
+
+          D0_jacMass.resize(nparsfinal);
+          Map<Matrix<float, 1, Dynamic, RowMajor>>(D0_jacMass.data(), 1, nparsfinal) =
+              (d0MassJacobian*dxdparms.leftCols<6>().transpose()).cast<float>();
+
+          if (fillJac_ &&
+              (!d0MassJacobianFinite || !dstAllFinite(K_jacRef) || !dstAllFinite(pi_jacRef) ||
+               !dstAllFinite(D0_jacMass) ||
+               K_jacRef.size() != 3 * nparsfinal || pi_jacRef.size() != 3 * nparsfinal ||
+               D0_jacMass.size() != nparsfinal || globalidxvfinal.size() != nparsfinal)) {
+            std::cout << "WARNING: invalid D0 Jacobian payload" << std::endl;
+            valid = false;
+            if (preserveTruthMatch) {
+              D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kNumericalFit);
+            }
+            globalidxvfinal.clear();
+            K_jacRef.clear();
+            pi_jacRef.clear();
+            D0_jacMass.clear();
+            nParms = 0;
+            break;
+          }
 
 
           if (false) {
@@ -2743,6 +4033,9 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 //       assert(hess.diagonal().minCoeff() > 0.);
       
       nParms = nparsfinal;
+      if (fillJac_) {
+        D0_jacobianValid = true;
+      }
 
       gradv.clear();
       gradv.resize(nparsfinal,0.);
@@ -2808,8 +4101,296 @@ void ResidualGlobalCorrectionMakerTwoTrackKPiG4e::produce(edm::Event &iEvent, co
 //       hessv.resize(nparsfinal*nparsfinal);
 //       Map<Matrix<float, Dynamic, Dynamic, RowMajor>>(hessv.data(), nparsfinal, nparsfinal) = hess.cast<float>();
       
+      D0_CVH_d = Jpsi_d;
+      D0_CVH_x = Jpsi_x;
+      D0_CVH_y = Jpsi_y;
+      D0_CVH_z = Jpsi_z;
+      D0_CVH_pt = Jpsi_pt;
+      D0_CVH_eta = Jpsi_eta;
+      D0_CVH_phi = Jpsi_phi;
+      D0_CVH_mass = Jpsi_mass;
+      D0_CVH_sigmaMass = Jpsi_sigmamass;
+      D0_CVH_edmval = edmval_cons0;
+      D0_CVH_niter = niter_cons0;
+      D0_CVH_valid = true;
+      D0_CVH_failureCode = static_cast<std::uint8_t>(D0CvhFailureCode::kSuccess);
+      K_CVH_pt = Muplus_pt;
+      K_CVH_eta = Muplus_eta;
+      K_CVH_phi = Muplus_phi;
+      pi_CVH_pt = Muminus_pt;
+      pi_CVH_eta = Muminus_eta;
+      pi_CVH_phi = Muminus_phi;
+      pis_CVH_pt = -99.;
+      pis_CVH_eta = -99.;
+      pis_CVH_phi = -99.;
+      pis_CVH_charge = 0;
+      pis_CVH_edmval = -99.;
+      K_CVH_dxy_BS = -99.;
+      K_CVH_sigdxy_BS = -99.;
+      K_CVH_dz_BS = -99.;
+      K_CVH_sigdz_BS = -99.;
+      K_CVH_dxy_PV = -99.;
+      K_CVH_sigdxy_PV = -99.;
+      K_CVH_dz_PV = -99.;
+      K_CVH_sigdz_PV = -99.;
+      pi_CVH_dxy_BS = -99.;
+      pi_CVH_sigdxy_BS = -99.;
+      pi_CVH_dz_BS = -99.;
+      pi_CVH_sigdz_BS = -99.;
+      pi_CVH_dxy_PV = -99.;
+      pi_CVH_sigdxy_PV = -99.;
+      pi_CVH_dz_PV = -99.;
+      pi_CVH_sigdz_PV = -99.;
+      pis_CVH_dxy_BS = -99.;
+      pis_CVH_sigdxy_BS = -99.;
+      pis_CVH_dz_BS = -99.;
+      pis_CVH_sigdz_BS = -99.;
+      pis_CVH_dxy_PV = -99.;
+      pis_CVH_sigdxy_PV = -99.;
+      pis_CVH_dz_PV = -99.;
+      pis_CVH_sigdz_PV = -99.;
+      Dst_CVH_mass = -99.;
+      Dst_CVH_deltaM = -99.;
+      Dst_CVH3_mass = -99.;
+      Dst_CVH3_deltaM = -99.;
+
+      const double d0CvhPx = D0_CVH_pt * std::cos(D0_CVH_phi);
+      const double d0CvhPy = D0_CVH_pt * std::sin(D0_CVH_phi);
+      const double d0CvhPz = D0_CVH_pt * std::sinh(D0_CVH_eta);
+      const ROOT::Math::PxPyPzMVector d0CvhP4(d0CvhPx, d0CvhPy, d0CvhPz, D0_CVH_mass);
+      const bool hasD0CvhVertexCovariance = covstate.rows() >= 10 && covstate.cols() >= 10;
+      Matrix<double, 3, 3> d0CvhVertexCovariance = Matrix<double, 3, 3>::Zero();
+      if (hasD0CvhVertexCovariance) {
+        d0CvhVertexCovariance = covstate.block<3, 3>(7, 7);
+      }
+
+      const auto fillCvhImpactParameters = [&](const DstLineState& lineState,
+                                               const Eigen::Matrix<double, 6, 6>& lineStateCov,
+                                               float& dxyBS,
+                                               float& sigdxyBS,
+                                               float& dzBS,
+                                               float& sigdzBS,
+                                               float& dxyPV,
+                                               float& sigdxyPV,
+                                               float& dzPV,
+                                               float& sigdzPV) {
+        if (bsH.isValid()) {
+          const DstLineImpactParameters bsIp =
+              dstLineImpactParameters(lineState,
+                                      bsH->x0(),
+                                      bsH->y0(),
+                                      bsH->z0(),
+                                      lineStateCov,
+                                      dstBeamSpotPointCovariance(*bsH));
+          dxyBS = bsIp.dxy;
+          sigdxyBS = bsIp.sigdxy;
+          dzBS = bsIp.dz;
+          sigdzBS = bsIp.sigdz;
+        }
+        if (primaryVertex != nullptr) {
+          const DstLineImpactParameters pvIp =
+              dstLineImpactParameters(lineState,
+                                      primaryVertex->x(),
+                                      primaryVertex->y(),
+                                      primaryVertex->z(),
+                                      lineStateCov,
+                                      dstPrimaryVertexCovariance(*primaryVertex));
+          dxyPV = pvIp.dxy;
+          sigdxyPV = pvIp.sigdxy;
+          dzPV = pvIp.dz;
+          sigdzPV = pvIp.sigdz;
+        }
+      };
+
+      const auto cvhTrackStateAndCovariance = [&](unsigned int trackIndex,
+                                                  double pt,
+                                                  double eta,
+                                                  double phi,
+                                                  DstLineState& lineState,
+                                                  Eigen::Matrix<double, 6, 6>& lineStateCov) {
+        lineState = {D0_CVH_x,
+                     D0_CVH_y,
+                     D0_CVH_z,
+                     pt * std::cos(phi),
+                     pt * std::sin(phi),
+                     pt * std::sinh(eta)};
+        lineStateCov = Eigen::Matrix<double, 6, 6>::Zero();
+        if (!hasD0CvhVertexCovariance || trackIndex > 1)
+          return false;
+
+        const unsigned int trackStateIdx = 3 * trackIndex;
+        const std::array<unsigned int, 5> stateIndices = {{trackStateIdx + 1, trackStateIdx + 2, 7, 8, 9}};
+        Eigen::Matrix<double, 6, 5> jac = Eigen::Matrix<double, 6, 5>::Zero();
+        jac(0, 2) = 1.;
+        jac(1, 3) = 1.;
+        jac(2, 4) = 1.;
+        jac(3, 0) = -pt * std::sinh(eta) * std::cos(phi);
+        jac(3, 1) = -lineState.py;
+        jac(4, 0) = -pt * std::sinh(eta) * std::sin(phi);
+        jac(4, 1) = lineState.px;
+        jac(5, 0) = pt;
+
+        Eigen::Matrix<double, 5, 5> subCov = Eigen::Matrix<double, 5, 5>::Zero();
+        for (unsigned int i = 0; i < stateIndices.size(); ++i) {
+          for (unsigned int j = 0; j < stateIndices.size(); ++j) {
+            subCov(i, j) = covstate(stateIndices[i], stateIndices[j]);
+          }
+        }
+        lineStateCov = jac * subCov * jac.transpose();
+        return true;
+      };
+
+      DstLineState kCvhLineState;
+      Eigen::Matrix<double, 6, 6> kCvhLineStateCov;
+      if (cvhTrackStateAndCovariance(0, K_CVH_pt, K_CVH_eta, K_CVH_phi, kCvhLineState, kCvhLineStateCov)) {
+        fillCvhImpactParameters(kCvhLineState,
+                                kCvhLineStateCov,
+                                K_CVH_dxy_BS,
+                                K_CVH_sigdxy_BS,
+                                K_CVH_dz_BS,
+                                K_CVH_sigdz_BS,
+                                K_CVH_dxy_PV,
+                                K_CVH_sigdxy_PV,
+                                K_CVH_dz_PV,
+                                K_CVH_sigdz_PV);
+      }
+      DstLineState piCvhLineState;
+      Eigen::Matrix<double, 6, 6> piCvhLineStateCov;
+      if (cvhTrackStateAndCovariance(1, pi_CVH_pt, pi_CVH_eta, pi_CVH_phi, piCvhLineState, piCvhLineStateCov)) {
+        fillCvhImpactParameters(piCvhLineState,
+                                piCvhLineStateCov,
+                                pi_CVH_dxy_BS,
+                                pi_CVH_sigdxy_BS,
+                                pi_CVH_dz_BS,
+                                pi_CVH_sigdz_BS,
+                                pi_CVH_dxy_PV,
+                                pi_CVH_sigdxy_PV,
+                                pi_CVH_dz_PV,
+                                pi_CVH_sigdz_PV);
+      }
+
+      // CVH supersedes the transient-track vertex fit for these diagnostic branches.
+      chi2_piK = D0_CVH_edmval;
+      pval_piK = -99.;
+      mass_piK = D0_CVH_mass;
+      D0_fit_mass = D0_CVH_mass;
+      if (primaryVertex != nullptr) {
+        cos_D0_PV = dstPointingCos3D(*primaryVertex, D0_CVH_x, D0_CVH_y, D0_CVH_z, d0CvhPx, d0CvhPy, d0CvhPz);
+        cosT_D0_PV = dstPointingCos2D(*primaryVertex, D0_CVH_x, D0_CVH_y, d0CvhPx, d0CvhPy);
+        d_vtxD0_PV = dstVertexDistance3D(*primaryVertex, D0_CVH_x, D0_CVH_y, D0_CVH_z);
+        if (hasD0CvhVertexCovariance) {
+          sigd_vtxD0_PV = dstVertexDistanceSignificance3D(*primaryVertex,
+                                                           D0_CVH_x,
+                                                           D0_CVH_y,
+                                                           D0_CVH_z,
+                                                           d0CvhVertexCovariance);
+        }
+      }
+      if (bsH.isValid()) {
+        dxy_vtxD0_BS = dstVertexTransverseDistanceFromBeamSpot(*bsH, D0_CVH_x, D0_CVH_y, D0_CVH_z);
+        if (hasD0CvhVertexCovariance) {
+          sigdxy_vtxD0_BS = dstBeamSpotTransverseDistanceSignificance(*bsH,
+                                                                       D0_CVH_x,
+                                                                       D0_CVH_y,
+                                                                       D0_CVH_z,
+                                                                       d0CvhVertexCovariance);
+        }
+      }
+
+      if (softPionTrack != nullptr) {
+        const auto pisRawP4 = dstTrackP4(*softPionTrack, softPionMass_);
+        auto dstCvhP4 = d0CvhP4 + pisRawP4;
+        Dst_CVH_mass = dstCvhP4.mass();
+        Dst_CVH_deltaM = Dst_CVH_mass - D0_CVH_mass;
+        mass_D0pis = Dst_CVH_mass;
+        deltaM_D0pis_piK = Dst_CVH_deltaM;
+        Dst_fit_mass = Dst_CVH_mass;
+        Dst_fit_deltaM = Dst_CVH_deltaM;
+        pis_dR_D0 = dstDeltaR(softPionTrack->eta(), softPionTrack->phi(), D0_CVH_eta, D0_CVH_phi);
+
+        if (useSoftPionCvh_) {
+          const edm::Ref<reco::TrackCollection> softPionRef(trackOrigH, softPionIndex);
+          pis_CVH_pt = (*softPionCvhPt)[softPionRef];
+          pis_CVH_eta = (*softPionCvhEta)[softPionRef];
+          pis_CVH_phi = (*softPionCvhPhi)[softPionRef];
+          pis_CVH_charge = (*softPionCvhCharge)[softPionRef];
+          pis_CVH_edmval = (*softPionCvhEdmval)[softPionRef];
+          if (pis_CVH_pt > 0.) {
+            const double pisCvhPx = pis_CVH_pt * std::cos(pis_CVH_phi);
+            const double pisCvhPy = pis_CVH_pt * std::sin(pis_CVH_phi);
+            const double pisCvhPz = pis_CVH_pt * std::sinh(pis_CVH_eta);
+            const ROOT::Math::PxPyPzMVector pisCvhP4(pisCvhPx, pisCvhPy, pisCvhPz, softPionMass_);
+            const auto dstCvh3P4 = d0CvhP4 + pisCvhP4;
+            Dst_CVH3_mass = dstCvh3P4.mass();
+            Dst_CVH3_deltaM = Dst_CVH3_mass - D0_CVH_mass;
+            dstCvhP4 = dstCvh3P4;
+            chi2_D0pis = pis_CVH_edmval;
+            mass_D0pis = Dst_CVH3_mass;
+            deltaM_D0pis_piK = Dst_CVH3_deltaM;
+            Dst_fit_mass = Dst_CVH3_mass;
+            Dst_fit_deltaM = Dst_CVH3_deltaM;
+            pis_dR_D0 = dstDeltaR(pis_CVH_eta, pis_CVH_phi, D0_CVH_eta, D0_CVH_phi);
+            const auto& pisMomCovPacked = (*softPionCvhMomCov)[softPionRef];
+            Eigen::Matrix<double, 6, 6> pisCvhLineStateCov = Eigen::Matrix<double, 6, 6>::Zero();
+            pisCvhLineStateCov.block<3, 3>(0, 0) = d0CvhVertexCovariance;
+            pisCvhLineStateCov.block<3, 3>(3, 3) = dstPackedUpperTriangularCovariance(pisMomCovPacked);
+            const DstLineState pisCvhLineState{D0_CVH_x,
+                                               D0_CVH_y,
+                                               D0_CVH_z,
+                                               pisCvhPx,
+                                               pisCvhPy,
+                                               pisCvhPz};
+            fillCvhImpactParameters(pisCvhLineState,
+                                    pisCvhLineStateCov,
+                                    pis_CVH_dxy_BS,
+                                    pis_CVH_sigdxy_BS,
+                                    pis_CVH_dz_BS,
+                                    pis_CVH_sigdz_BS,
+                                    pis_CVH_dxy_PV,
+                                    pis_CVH_sigdxy_PV,
+                                    pis_CVH_dz_PV,
+                                    pis_CVH_sigdz_PV);
+          }
+        }
+        if (primaryVertex != nullptr) {
+          cos_Dst_PV = dstPointingCos3D(*primaryVertex,
+                                        D0_CVH_x,
+                                        D0_CVH_y,
+                                        D0_CVH_z,
+                                        dstCvhP4.px(),
+                                        dstCvhP4.py(),
+                                        dstCvhP4.pz());
+          cosT_Dst_PV = dstPointingCos2D(*primaryVertex, D0_CVH_x, D0_CVH_y, dstCvhP4.px(), dstCvhP4.py());
+          d_vtxDst_PV = dstVertexDistance3D(*primaryVertex, D0_CVH_x, D0_CVH_y, D0_CVH_z);
+          dxy_vtxDst_PV = dstVertexDistance2D(*primaryVertex, D0_CVH_x, D0_CVH_y);
+          if (hasD0CvhVertexCovariance) {
+            sigd_vtxDst_PV = dstVertexDistanceSignificance3D(*primaryVertex,
+                                                              D0_CVH_x,
+                                                              D0_CVH_y,
+                                                              D0_CVH_z,
+                                                              d0CvhVertexCovariance);
+            sigdxy_vtxDst_PV = dstVertexDistanceSignificance2D(*primaryVertex,
+                                                                D0_CVH_x,
+                                                                D0_CVH_y,
+                                                                d0CvhVertexCovariance);
+          }
+        }
+      }
+
       if (fillTrackTree_) {
-        tree->Fill();
+        if (preserveTruthMatch) {
+          truthMatchFillGuard.fill();
+        } else {
+          tree->Fill();
+        }
+      }
+
+      if (enforceUniqueTracks_) {
+        usedTrackIndices.insert(itrackIndex);
+        usedTrackIndices.insert(jtrackIndex);
+        if (softPionTrack != nullptr) {
+          usedTrackIndices.insert(softPionIndex);
+        }
       }
       
 

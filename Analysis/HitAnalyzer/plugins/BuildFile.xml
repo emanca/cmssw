@@ -39,6 +39,7 @@
 <use name="RecoVertex/KinematicFit"/>
 <use name="Alignment/CommonAlignment"/>
 <use name="TrackPropagation/Geant4e"/>
+<use name="root"/>
 
 <!-- <use   name="geant4"/> -->
 

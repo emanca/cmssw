@@ -374,18 +374,17 @@ void ResidualGlobalCorrectionMakerG4e::produce(edm::Event &iEvent, const edm::Ev
 
   std::array<double, 3> refParmsMomD;
 
-  if (doMuonAssoc_) {
-    corPtV.assign(muonAssoc->ref()->size(), -99.);
-    corEtaV.assign(muonAssoc->ref()->size(), -99.);
-    corPhiV.assign(muonAssoc->ref()->size(), -99.);
-    corChargeV.assign(muonAssoc->ref()->size(), -99);
-    edmvalV.assign(muonAssoc->ref()->size(), -99.);
-    nValidHitsV.assign(muonAssoc->ref()->size(), -99);
-    nValidPixelHitsV.assign(muonAssoc->ref()->size(), -99);
-    globalidxsV.assign(muonAssoc->ref()->size(), std::vector<int>());
-    jacRefV.assign(muonAssoc->ref()->size(), std::vector<float>());
-    momCovV.assign(muonAssoc->ref()->size(), std::vector<float>());
-  }
+  const unsigned int outputCollectionSize = doMuonAssoc_ ? muonAssoc->ref()->size() : trackOrigH->size();
+  corPtV.assign(outputCollectionSize, -99.);
+  corEtaV.assign(outputCollectionSize, -99.);
+  corPhiV.assign(outputCollectionSize, -99.);
+  corChargeV.assign(outputCollectionSize, -99);
+  edmvalV.assign(outputCollectionSize, -99.);
+  nValidHitsV.assign(outputCollectionSize, -99);
+  nValidPixelHitsV.assign(outputCollectionSize, -99);
+  globalidxsV.assign(outputCollectionSize, std::vector<int>());
+  jacRefV.assign(outputCollectionSize, std::vector<float>());
+  momCovV.assign(outputCollectionSize, std::vector<float>());
 
 //   for (const reco::Track &track : *trackOrigH) {
   for (unsigned int itrack = 0; itrack < trackOrigH->size(); ++itrack) {
@@ -2925,7 +2924,8 @@ void ResidualGlobalCorrectionMakerG4e::produce(edm::Event &iEvent, const edm::Ev
 
 
 
-    if (muonref.isNonnull()) {
+    const unsigned int outputIndex = doMuonAssoc_ ? muonref.index() : trackref.index();
+    if (!doMuonAssoc_ || muonref.isNonnull()) {
       const double qbpupd = refParmsMomD[0];
       const double lamupd = refParmsMomD[1];
       const double phiupd = refParmsMomD[2];
@@ -2936,28 +2936,28 @@ void ResidualGlobalCorrectionMakerG4e::produce(edm::Event &iEvent, const edm::Ev
       const double thetaupd = M_PI_2 - lamupd;
       const double etaupd = -std::log(std::tan(0.5*thetaupd));
 
-      corPtV[muonref.index()] = ptupd;
-      corEtaV[muonref.index()] = etaupd;
-      corPhiV[muonref.index()] = phiupd;
-      corChargeV[muonref.index()] = chargeupd;
-      edmvalV[muonref.index()] = edmval;
-      nValidHitsV[muonref.index()] = nvalid;
-      nValidPixelHitsV[muonref.index()] = nvalidpixel;
+      corPtV[outputIndex] = ptupd;
+      corEtaV[outputIndex] = etaupd;
+      corPhiV[outputIndex] = phiupd;
+      corChargeV[outputIndex] = chargeupd;
+      edmvalV[outputIndex] = edmval;
+      nValidHitsV[outputIndex] = nvalid;
+      nValidPixelHitsV[outputIndex] = nvalidpixel;
 
-      auto &iglobalidxv = globalidxsV[muonref.key()];
+      auto &iglobalidxv = globalidxsV[outputIndex];
       iglobalidxv.clear();
       iglobalidxv.reserve(globalidxvfinal.size());
       for (auto val : globalidxvfinal) {
         iglobalidxv.push_back(val);
       }
 
-      auto &ijacrefv = jacRefV[muonref.key()];
+      auto &ijacrefv = jacRefV[outputIndex];
       ijacrefv.assign(3*nparsfinal, 0.);
       //eigen representation of the underlying vector storage
       Map<Matrix<float, 3, Dynamic, RowMajor> > momjacrefout(ijacrefv.data(), 3, nparsfinal);
       momjacrefout = ( (dxdparms).leftCols<3>().transpose() ).cast<float>();
 
-      auto &imomCov = momCovV[muonref.key()];
+      auto &imomCov = momCovV[outputIndex];
       imomCov.assign(3*3, 0.);
       Map<Matrix<float, 3, 3, RowMajor>> momCovout(imomCov.data(), 3, 3);
       momCovout.triangularView<Upper>() = covfull.topLeftCorner<3,3>().cast<float>();
@@ -3023,6 +3023,46 @@ void ResidualGlobalCorrectionMakerG4e::produce(edm::Event &iEvent, const edm::Ev
 
     edm::ValueMap<std::vector<float>>::Filler momCovMapFiller(momCovMap);
     momCovMapFiller.insert(muonAssoc->ref(), std::make_move_iterator(momCovV.begin()), std::make_move_iterator(momCovV.end()));
+    momCovMapFiller.fill();
+  } else {
+    edm::ValueMap<float>::Filler corPtMapFiller(corPtMap);
+    corPtMapFiller.insert(trackOrigH, std::make_move_iterator(corPtV.begin()), std::make_move_iterator(corPtV.end()));
+    corPtMapFiller.fill();
+
+    edm::ValueMap<float>::Filler corEtaMapFiller(corEtaMap);
+    corEtaMapFiller.insert(trackOrigH, std::make_move_iterator(corEtaV.begin()), std::make_move_iterator(corEtaV.end()));
+    corEtaMapFiller.fill();
+
+    edm::ValueMap<float>::Filler corPhiMapFiller(corPhiMap);
+    corPhiMapFiller.insert(trackOrigH, std::make_move_iterator(corPhiV.begin()), std::make_move_iterator(corPhiV.end()));
+    corPhiMapFiller.fill();
+
+    edm::ValueMap<int>::Filler corChargeMapFiller(corChargeMap);
+    corChargeMapFiller.insert(trackOrigH, std::make_move_iterator(corChargeV.begin()), std::make_move_iterator(corChargeV.end()));
+    corChargeMapFiller.fill();
+
+    edm::ValueMap<float>::Filler edmvalMapFiller(edmvalMap);
+    edmvalMapFiller.insert(trackOrigH, std::make_move_iterator(edmvalV.begin()), std::make_move_iterator(edmvalV.end()));
+    edmvalMapFiller.fill();
+
+    edm::ValueMap<int>::Filler nValidHitsMapFiller(nValidHitsMap);
+    nValidHitsMapFiller.insert(trackOrigH, std::make_move_iterator(nValidHitsV.begin()), std::make_move_iterator(nValidHitsV.end()));
+    nValidHitsMapFiller.fill();
+
+    edm::ValueMap<int>::Filler nValidPixelHitsMapFiller(nValidPixelHitsMap);
+    nValidPixelHitsMapFiller.insert(trackOrigH, std::make_move_iterator(nValidPixelHitsV.begin()), std::make_move_iterator(nValidPixelHitsV.end()));
+    nValidPixelHitsMapFiller.fill();
+
+    edm::ValueMap<std::vector<int>>::Filler globalidxsMapFiller(globalidxsMap);
+    globalidxsMapFiller.insert(trackOrigH, std::make_move_iterator(globalidxsV.begin()), std::make_move_iterator(globalidxsV.end()));
+    globalidxsMapFiller.fill();
+
+    edm::ValueMap<std::vector<float>>::Filler jacRefMapFiller(jacRefMap);
+    jacRefMapFiller.insert(trackOrigH, std::make_move_iterator(jacRefV.begin()), std::make_move_iterator(jacRefV.end()));
+    jacRefMapFiller.fill();
+
+    edm::ValueMap<std::vector<float>>::Filler momCovMapFiller(momCovMap);
+    momCovMapFiller.insert(trackOrigH, std::make_move_iterator(momCovV.begin()), std::make_move_iterator(momCovV.end()));
     momCovMapFiller.fill();
   }
 

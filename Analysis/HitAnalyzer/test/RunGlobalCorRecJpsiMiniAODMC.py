@@ -1,6 +1,7 @@
 import FWCore.ParameterSet.Config as cms
 
 from Configuration.Eras.Era_Run2_2016_cff import Run2_2016
+from Configuration.Eras.Era_Run2_2018_cff import Run2_2018
 from Configuration.AlCa.GlobalTag import GlobalTag
 from FWCore.ParameterSet.VarParsing import VarParsing
 from Analysis.HitAnalyzer.OniaNtuplizer_cff import onia_settings
@@ -16,17 +17,64 @@ options.register(
     VarParsing.varType.float,
     "Minimum slimmedMuon pT used to build the refitted track collection.",
 )
+options.register(
+    "year",
+    2016,
+    VarParsing.multiplicity.singleton,
+    VarParsing.varType.int,
+    "Data-taking year used to select the CMSSW era and MC conditions (2016 or 2018).",
+)
+options.register(
+    "doGen",
+    True,
+    VarParsing.multiplicity.singleton,
+    VarParsing.varType.bool,
+    "Fill the gen-level branches of the output tree (required for the muon scale "
+    "response systematics and MC-truth checks). Default on for MC; pass "
+    "doGen=0 only when rerunning legacy productions that must stay identical.",
+)
 options.parseArguments()
 
 onia = onia_settings("jpsi")
+if options.year not in (2016, 2018):
+    raise RuntimeError("Unsupported year {}; use year=2016 or year=2018.".format(options.year))
+
+year_configuration = {
+    2016: {
+        "era": Run2_2016,
+        "global_tag": "106X_mcRun2_asymptotic_v17",
+        "geometry_tag": "XMLFILE_Geometry_2016_81YV1_Extended2016_mc",
+    },
+    2018: {
+        "era": Run2_2018,
+        "global_tag": "102X_upgrade2018_realistic_v12",
+        "geometry_tag": None,
+    },
+}[options.year]
+
 input_files = list(options.inputFiles)
 if not input_files:
-    input_files = [onia["mc_input"]]
+    input_files = [
+        {
+            2016: (
+                "/store/mc/RunIISummer20UL16MiniAODv2/"
+                "BuToJpsiK_BMuonFilter_SoftQCDnonD_TuneCP5_13TeV-pythia8-evtgen/"
+                "MINIAODSIM/BPH_106X_mcRun2_asymptotic_v17-v2/60000/"
+                "CA5DA24E-EB62-6948-B15B-CE63005A8A95.root"
+            ),
+            2018: (
+                "/store/mc/RunIIAutumn18MiniAOD/"
+                "BuToJpsiK_BMuonFilter_TuneCP5_13TeV-pythia8-evtgen/"
+                "MINIAODSIM/102X_upgrade2018_realistic_v15-v1/20000/"
+                "E4F2E0BE-896D-2843-B56D-808688E567B7.root"
+            ),
+        }[options.year]
+    ]
 
 output_base = options.outputFile[:-5] if options.outputFile.endswith(".root") else options.outputFile
 
 
-process = cms.Process("RECO2", Run2_2016)
+process = cms.Process("RECO2", year_configuration["era"])
 
 process.load("Configuration.StandardSequences.Services_cff")
 process.load("FWCore.MessageService.MessageLogger_cfi")
@@ -58,15 +106,16 @@ process.configurationMetadata = cms.untracked.PSet(
     version=cms.untracked.string("$Revision: 1.19 $"),
 )
 
-process.GlobalTag = GlobalTag(process.GlobalTag, "auto:run2_mc", "")
-process.GlobalTag.toGet = cms.VPSet(
-    cms.PSet(
-        record=cms.string("GeometryFileRcd"),
-        tag=cms.string("XMLFILE_Geometry_2016_81YV1_Extended2016_mc"),
-        label=cms.untracked.string("Extended"),
-    ),
-)
-process.XMLFromDBSource.label = cms.string("Extended")
+process.GlobalTag = GlobalTag(process.GlobalTag, year_configuration["global_tag"], "")
+if year_configuration["geometry_tag"]:
+    process.GlobalTag.toGet = cms.VPSet(
+        cms.PSet(
+            record=cms.string("GeometryFileRcd"),
+            tag=cms.string(year_configuration["geometry_tag"]),
+            label=cms.untracked.string("Extended"),
+        ),
+    )
+    process.XMLFromDBSource.label = cms.string("Extended")
 
 process.MessageLogger.cerr.FwkReport.reportEvery = 1000
 
@@ -87,7 +136,7 @@ process.refittedMuonTracks = RecoTracker.TrackProducer.TrackRefitter_cfi.TrackRe
 
 process.globalCor = process.residualGlobalCorrectionMakerTwoTrackG4e.clone(
     src=cms.InputTag("refittedMuonTracks"),
-    doGen=cms.bool(False),
+    doGen=cms.bool(options.doGen),
     genParticles=cms.InputTag("prunedGenParticles"),
     pileupInfo=cms.InputTag("slimmedAddPileupInfo"),
     doSim=cms.bool(False),

@@ -17,8 +17,15 @@
 #include "RecoVertex/KinematicFit/interface/MultiTrackMassKinematicConstraint.h"
 #include "RecoVertex/KinematicFit/interface/MultiTrackPointingKinematicConstraint.h"
 #include "RecoVertex/KinematicFit/interface/CombinedKinematicConstraint.h"
+#include "RecoVertex/KalmanVertexFit/interface/KalmanVertexFitter.h"
+#include "RecoVertex/VertexPrimitives/interface/TransientVertex.h"
+#include "DataFormats/VertexReco/interface/Vertex.h"
+#include "DataFormats/GeometryCommonDetAlgo/interface/GlobalError.h"
+#include "DataFormats/GeometryVector/interface/GlobalPoint.h"
+#include "TrackingTools/PatternTools/interface/ClosestApproachInRPhi.h"
 #include "DataFormats/MuonReco/interface/Muon.h"
 #include "DataFormats/Math/interface/deltaR.h"
+#include "DataFormats/Math/interface/Point3D.h"
 
 #include "Math/Vector4Dfwd.h"
 
@@ -26,6 +33,10 @@
 
 #include "FWCore/Common/interface/TriggerNames.h"
 
+#include "TMath.h"
+
+#include <algorithm>
+#include <cmath>
 #include <exception>
 
 
@@ -55,6 +66,20 @@ private:
   float Jpsi_eta;
   float Jpsi_phi;
   float Jpsi_mass;
+  bool Jpsi_isOS;
+  float Jpsi_dR;
+  float Jpsi_maxHltDr;
+  float Jpsi_dca;
+  bool Jpsi_dcaValid;
+  bool Jpsi_vtxValid;
+  float Jpsi_vtxChi2;
+  float Jpsi_vtxNdof;
+  float Jpsi_vtxNormChi2;
+  float Jpsi_vtxProb;
+  float Jpsi_lxy;
+  float Jpsi_lxyErr;
+  float Jpsi_lxySig;
+  float Jpsi_cosAlpha;
   
   float Jpsi_sigmamass;
   
@@ -90,10 +115,12 @@ private:
   float Muplustrk_pt;
   float Muplustrk_eta;
   float Muplustrk_phi;
+  float Muplustrk_hltDr;
   
   float Muminustrk_pt;
   float Muminustrk_eta;
   float Muminustrk_phi;
+  float Muminustrk_hltDr;
   
   float Jpsicons_d;
   float Jpsicons_x;
@@ -226,6 +253,20 @@ void ResidualGlobalCorrectionMakerTwoTrackG4e::beginStream(edm::StreamID streami
     tree->Branch("Jpsi_eta", &Jpsi_eta);
     tree->Branch("Jpsi_phi", &Jpsi_phi);
     tree->Branch("Jpsi_mass", &Jpsi_mass);
+    tree->Branch("Jpsi_isOS", &Jpsi_isOS);
+    tree->Branch("Jpsi_dR", &Jpsi_dR);
+    tree->Branch("Jpsi_maxHltDr", &Jpsi_maxHltDr);
+    tree->Branch("Jpsi_dca", &Jpsi_dca);
+    tree->Branch("Jpsi_dcaValid", &Jpsi_dcaValid);
+    tree->Branch("Jpsi_vtxValid", &Jpsi_vtxValid);
+    tree->Branch("Jpsi_vtxChi2", &Jpsi_vtxChi2);
+    tree->Branch("Jpsi_vtxNdof", &Jpsi_vtxNdof);
+    tree->Branch("Jpsi_vtxNormChi2", &Jpsi_vtxNormChi2);
+    tree->Branch("Jpsi_vtxProb", &Jpsi_vtxProb);
+    tree->Branch("Jpsi_lxy", &Jpsi_lxy);
+    tree->Branch("Jpsi_lxyErr", &Jpsi_lxyErr);
+    tree->Branch("Jpsi_lxySig", &Jpsi_lxySig);
+    tree->Branch("Jpsi_cosAlpha", &Jpsi_cosAlpha);
     
     tree->Branch("Jpsi_sigmamass", &Jpsi_sigmamass);
     
@@ -261,10 +302,12 @@ void ResidualGlobalCorrectionMakerTwoTrackG4e::beginStream(edm::StreamID streami
     tree->Branch("Muplustrk_pt", &Muplustrk_pt);
     tree->Branch("Muplustrk_eta", &Muplustrk_eta);
     tree->Branch("Muplustrk_phi", &Muplustrk_phi);
+    tree->Branch("Muplustrk_hltDr", &Muplustrk_hltDr);
     
     tree->Branch("Muminustrk_pt", &Muminustrk_pt);
     tree->Branch("Muminustrk_eta", &Muminustrk_eta);
     tree->Branch("Muminustrk_phi", &Muminustrk_phi);
+    tree->Branch("Muminustrk_hltDr", &Muminustrk_hltDr);
     
     tree->Branch("Jpsicons_d", &Jpsicons_d);
     tree->Branch("Jpsicons_x", &Jpsicons_x);
@@ -624,6 +667,144 @@ void ResidualGlobalCorrectionMakerTwoTrackG4e::produce(edm::Event &iEvent, const
       
       
       const reco::TransientTrack jtt = TTBuilder->build(*jtrack);
+
+      Jpsi_isOS = itrack->charge() * jtrack->charge() < 0;
+      Jpsi_dR = -1.f;
+      Jpsi_maxHltDr = -1.f;
+      Muplustrk_hltDr = -1.f;
+      Muminustrk_hltDr = -1.f;
+      Jpsi_dca = -1.f;
+      Jpsi_dcaValid = false;
+      Jpsi_vtxValid = false;
+      Jpsi_vtxChi2 = -1.f;
+      Jpsi_vtxNdof = -1.f;
+      Jpsi_vtxNormChi2 = -1.f;
+      Jpsi_vtxProb = -1.f;
+      Jpsi_lxy = -1.f;
+      Jpsi_lxyErr = -1.f;
+      Jpsi_lxySig = -1.f;
+      Jpsi_cosAlpha = -1.f;
+
+      // Jpsi_dR is diagnostic only: the 2016 HLT MaxDr cut uses per-track hltDr, not pair deltaR.
+      const float dR = static_cast<float>(reco::deltaR(*itrack, *jtrack));
+      if (std::isfinite(dR) && dR >= 0.f) {
+        Jpsi_dR = dR;
+      }
+
+      const auto computeHltDr = [&bsH](const reco::Track& track) {
+        const double pt = track.pt();
+        if (!std::isfinite(pt) || pt <= 0.) {
+          return -1.f;
+        }
+        const double value = std::abs((-(track.vx() - bsH->x0()) * track.py() +
+                                       (track.vy() - bsH->y0()) * track.px()) /
+                                      pt);
+        const float hltDr = static_cast<float>(value);
+        return std::isfinite(value) && std::isfinite(hltDr) ? hltDr : -1.f;
+      };
+      const float ihltDr = computeHltDr(*itrack);
+      const float jhltDr = computeHltDr(*jtrack);
+      if (Jpsi_isOS) {
+        Muplustrk_hltDr = itrack->charge() > 0 ? ihltDr : jhltDr;
+        Muminustrk_hltDr = itrack->charge() < 0 ? ihltDr : jhltDr;
+      }
+      if (ihltDr >= 0.f && jhltDr >= 0.f) {
+        Jpsi_maxHltDr = std::max(ihltDr, jhltDr);
+      }
+
+      const TrajectoryStateClosestToPoint ittTS = itt.impactPointTSCP();
+      const TrajectoryStateClosestToPoint jttTS = jtt.impactPointTSCP();
+      if (ittTS.isValid() && jttTS.isValid()) {
+        ClosestApproachInRPhi cApp;
+        cApp.calculate(ittTS.theState(), jttTS.theState());
+        if (cApp.status()) {
+          Jpsi_dca = cApp.distance();
+          Jpsi_dcaValid = true;
+        }
+      }
+
+      std::vector<reco::TransientTrack> t_tks;
+      t_tks.push_back(itt);
+      t_tks.push_back(jtt);
+      KalmanVertexFitter kvf;
+      const TransientVertex tv = kvf.vertex(t_tks);
+      if (tv.isValid()) {
+        Jpsi_vtxValid = true;
+        const reco::Vertex vertex = tv;
+        const double vtxChi2 = vertex.chi2();
+        const double vtxNdof = vertex.ndof();
+        const double vtxNormChi2 = vertex.normalizedChi2();
+        const float vtxChi2Value = static_cast<float>(vtxChi2);
+        const float vtxNdofValue = static_cast<float>(vtxNdof);
+        const float vtxNormChi2Value = static_cast<float>(vtxNormChi2);
+        if (std::isfinite(vtxChi2) && std::isfinite(vtxChi2Value)) {
+          Jpsi_vtxChi2 = vtxChi2Value;
+        }
+        if (std::isfinite(vtxNdof) && std::isfinite(vtxNdofValue)) {
+          Jpsi_vtxNdof = vtxNdofValue;
+        }
+        if (std::isfinite(vtxNormChi2) && std::isfinite(vtxNormChi2Value)) {
+          Jpsi_vtxNormChi2 = vtxNormChi2Value;
+        }
+        if (vtxChi2 >= 0. && vtxNdof > 0.) {
+          const double vtxProb = TMath::Prob(vtxChi2, vtxNdof);
+          const float vtxProbValue = static_cast<float>(vtxProb);
+          if (std::isfinite(vtxProb) && std::isfinite(vtxProbValue)) {
+            Jpsi_vtxProb = vtxProbValue;
+          }
+        }
+
+        const reco::Vertex::Point& vpoint = vertex.position();
+        const GlobalPoint secondaryVertex(vpoint.x(), vpoint.y(), vpoint.z());
+        const reco::Vertex::Error verr = vertex.error();
+        const GlobalError err(verr.At(0, 0),
+                              verr.At(1, 0),
+                              verr.At(1, 1),
+                              verr.At(2, 0),
+                              verr.At(2, 1),
+                              verr.At(2, 2));
+
+        // Match HLTDisplacedmumuFilter: vertex-only transverse decay-length significance.
+        const GlobalPoint displacementFromBeamspot(
+            secondaryVertex.x() - (bsH->x0() + (secondaryVertex.z() - bsH->z0()) * bsH->dxdz()),
+            secondaryVertex.y() - (bsH->y0() + (secondaryVertex.z() - bsH->z0()) * bsH->dydz()),
+            0.);
+        const double lxy = displacementFromBeamspot.perp();
+        const double lxyerr2 = err.rerr(displacementFromBeamspot);
+        const float lxyValue = static_cast<float>(lxy);
+        if (std::isfinite(lxy) && std::isfinite(lxyValue) && lxy >= 0.) {
+          Jpsi_lxy = lxyValue;
+        }
+        if (std::isfinite(lxyerr2) && lxyerr2 > 0.) {
+          const double lxyerr = std::sqrt(lxyerr2);
+          if (std::isfinite(lxyerr) && lxyerr > 0.) {
+            const float lxyerrValue = static_cast<float>(lxyerr);
+            if (std::isfinite(lxyerrValue) && std::isfinite(lxy) && lxy >= 0.) {
+              Jpsi_lxyErr = lxyerrValue;
+            }
+            if (std::isfinite(lxy) && lxy > 0.) {
+              const float lxySig = static_cast<float>(lxy / lxyerr);
+              if (std::isfinite(lxySig) && lxySig > 0.f) {
+                Jpsi_lxySig = lxySig;
+              }
+            }
+          }
+        }
+
+        const math::XYZVector pperp(itrack->px() + jtrack->px(),
+                                    itrack->py() + jtrack->py(),
+                                    0.);
+        const reco::Vertex::Point vperp(displacementFromBeamspot.x(),
+                                        displacementFromBeamspot.y(),
+                                        0.);
+        const double pointingDenominator = vperp.R() * pperp.R();
+        if (std::isfinite(pointingDenominator) && pointingDenominator > 0.) {
+          const float cosAlpha = vperp.Dot(pperp) / pointingDenominator;
+          if (std::isfinite(cosAlpha)) {
+            Jpsi_cosAlpha = cosAlpha;
+          }
+        }
+      }
 
       const reco::Muon *matchedmuon1 = nullptr;
       if (doMuons_) {

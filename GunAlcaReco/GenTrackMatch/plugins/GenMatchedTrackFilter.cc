@@ -1,23 +1,25 @@
 // GenMatchedTrackFilter
 //
-// Loose gen-matched track preselection for particle-gun ALCARECO production:
-// keeps only tracks loosely matched (deltaR + relative pT) to a *stable*
-// generator-level particle (status 1, charged), and emits the matched subset
-// (clones preserving TrackExtra references, so downstream refits keep hits)
-// plus ValueMaps with the match observables.
+// Loose gen-matched track selection for particle-gun ALCARECO production:
+// keeps only tracks loosely matched (deltaR + relative pT) to a stable,
+// charged generator-level particle. Filter semantics (EDFilter):
+//   * emits a reco::TrackCollection with the matched clones (preserving
+//     TrackExtra references, so downstream refits keep hits),
+//   * the event passes iff it contains at least one matched track,
+// so pure-pileup events are dropped and files carry only matched content.
+// No ValueMap products (maps removed by design decision of 2026-10-21).
 //
 // Motivation: drop PU tracks in gun+premix samples while keeping the signal
-// track and its decay/interaction daughters, per the 2026-10-16 campaign
-// decision (see MuKPiGun_UL16_Premix_e2e_v1/CAMPAIGN_NOTES.md).
+// track and its decay/interaction daughters, per the campaign decision
+// (see MuKPiGun_UL16_Premix_e2e_v1/CAMPAIGN_NOTES.md).
 
-#include "FWCore/Framework/interface/stream/EDProducer.h"
+#include "FWCore/Framework/interface/stream/EDFilter.h"
 #include "FWCore/Framework/interface/Event.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
 #include "DataFormats/TrackReco/interface/Track.h"
 #include "DataFormats/TrackReco/interface/TrackFwd.h"
 #include "DataFormats/HepMCCandidate/interface/GenParticle.h"
-#include "DataFormats/Common/interface/ValueMap.h"
 #include "DataFormats/Common/interface/Handle.h"
 #include "DataFormats/Math/interface/deltaR.h"
 
@@ -25,10 +27,10 @@
 #include <string>
 #include <vector>
 
-class GenMatchedTrackFilter : public edm::stream::EDProducer<> {
+class GenMatchedTrackFilter : public edm::stream::EDFilter<> {
 public:
   explicit GenMatchedTrackFilter(const edm::ParameterSet &iConfig);
-  void produce(edm::Event &iEvent, const edm::EventSetup &iSetup) override;
+  bool filter(edm::Event &iEvent, const edm::EventSetup &iSetup) override;
 
 private:
   edm::EDGetTokenT<reco::TrackCollection> srcToken_;
@@ -42,10 +44,8 @@ private:
 };
 
 GenMatchedTrackFilter::GenMatchedTrackFilter(const edm::ParameterSet &iConfig)
-    : srcToken_(consumes<reco::TrackCollection>(
-          iConfig.getParameter<edm::InputTag>("src"))),
-      genToken_(consumes<reco::GenParticleCollection>(
-          iConfig.getParameter<edm::InputTag>("genParticles"))),
+    : srcToken_(consumes<reco::TrackCollection>(iConfig.getParameter<edm::InputTag>("src"))),
+      genToken_(consumes<reco::GenParticleCollection>(iConfig.getParameter<edm::InputTag>("genParticles"))),
       dRMatchMax_(iConfig.getParameter<double>("dRMatchMax")),
       dPtRelMatchMax_(iConfig.getParameter<double>("dPtRelMatchMax")),
       genMinPt_(iConfig.getParameter<double>("genMinPt")),
@@ -53,12 +53,9 @@ GenMatchedTrackFilter::GenMatchedTrackFilter(const edm::ParameterSet &iConfig)
       keepUnmatchedAll_(iConfig.getParameter<bool>("keepUnmatchedAll")),
       keepEveryNthUnmatched_(iConfig.getParameter<unsigned>("keepEveryNthUnmatched")) {
   produces<reco::TrackCollection>();
-  produces<edm::ValueMap<float>>("dRMatch");
-  produces<edm::ValueMap<float>>("dPtRelMatch");
-  produces<edm::ValueMap<int>>("genMatched");
 }
 
-void GenMatchedTrackFilter::produce(edm::Event &iEvent, const edm::EventSetup &) {
+bool GenMatchedTrackFilter::filter(edm::Event &iEvent, const edm::EventSetup &) {
   edm::Handle<reco::TrackCollection> tracks;
   iEvent.getByToken(srcToken_, tracks);
   edm::Handle<reco::GenParticleCollection> gens;
@@ -80,14 +77,11 @@ void GenMatchedTrackFilter::produce(edm::Event &iEvent, const edm::EventSetup &)
   }
 
   auto outTracks = std::make_unique<reco::TrackCollection>();
-  std::vector<float> bestDR;
-  std::vector<float> bestDptRel;
-  std::vector<int> wasMatched;
+  bool eventMatched = false;
 
   unsigned trackIndex = 0;
   for (const auto &trk : *tracks) {
     float bestR = dRMatchMax_;
-    float bestPt = -1.f;
     bool matched = false;
     for (const auto *g : stable) {
       const double dr = reco::deltaR(trk.eta(), trk.phi(), g->eta(), g->phi());
@@ -97,43 +91,19 @@ void GenMatchedTrackFilter::produce(edm::Event &iEvent, const edm::EventSetup &)
       if (dptrel > dPtRelMatchMax_)
         continue;
       bestR = static_cast<float>(dr);
-      bestPt = dptrel;
       matched = true;
     }
     const bool keep = matched || keepUnmatchedAll_ ||
                       (keepEveryNthUnmatched_ > 0 && (trackIndex % keepEveryNthUnmatched_) == 0);
     if (keep) {
       outTracks->push_back(trk);
-      bestDR.push_back(matched ? bestR : -1.f);
-      bestDptRel.push_back(matched ? bestPt : -1.f);
-      wasMatched.push_back(matched ? 1 : 0);
+      eventMatched = true;
     }
     ++trackIndex;
   }
 
-  const edm::OrphanHandle<reco::TrackCollection> outHandle = iEvent.put(std::move(outTracks));
-
-  {
-    auto vm = std::make_unique<edm::ValueMap<float>>();
-    edm::ValueMap<float>::Filler filler(*vm);
-    filler.insert(outHandle, bestDR.begin(), bestDR.end());
-    filler.fill();
-    iEvent.put(std::move(vm), "dRMatch");
-  }
-  {
-    auto vm = std::make_unique<edm::ValueMap<float>>();
-    edm::ValueMap<float>::Filler filler(*vm);
-    filler.insert(outHandle, bestDptRel.begin(), bestDptRel.end());
-    filler.fill();
-    iEvent.put(std::move(vm), "dPtRelMatch");
-  }
-  {
-    auto vm = std::make_unique<edm::ValueMap<int>>();
-    edm::ValueMap<int>::Filler filler(*vm);
-    filler.insert(outHandle, wasMatched.begin(), wasMatched.end());
-    filler.fill();
-    iEvent.put(std::move(vm), "genMatched");
-  }
+  iEvent.put(std::move(outTracks));
+  return eventMatched;
 }
 
 DEFINE_FWK_MODULE(GenMatchedTrackFilter);

@@ -63,6 +63,7 @@ process.ALCARECOStreamMuon = cms.OutputModule(
         "drop recoTracks_ALCARECOMuon_*_*",
         "drop recoTracks_generalTracks_*_*",
         "keep *_genMatchedTracks_*_*",
+        "keep *_ALCARECOMuon_*_*",
         "keep *_genParticles_*_*",
         "keep SimTracks_g4SimHits_*_*",
         "keep SimVertexs_g4SimHits_*_*",

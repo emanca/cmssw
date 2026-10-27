@@ -32,7 +32,11 @@ process.ALCARECOMuon = _ats.AlignmentTrackSelector.clone(
     applyBasicCuts = False,
 )
 
-# ------- loose gen-match FILTER (dR<=0.3, unmatched tracks+events dropped) -------
+# ------- loose gen-match SELECTOR (dR<=0.3): keeps the matched tracks with their
+# stock clone family (extras + owned hits + clusters) and, with filter=True,
+# drops events in which nothing matched. filter is NOT optional: ObjectSelector
+# defaults filter_ to false and only reads the parameter when a bool of that name
+# is present in the PSet, so omitting it silently keeps pure-pileup events. -------
 process.genMatchedTracks = cms.EDFilter(
     "GenMatchedTrackSelectorModule",
     src = cms.InputTag("ALCARECOMuon"),
@@ -41,8 +45,7 @@ process.genMatchedTracks = cms.EDFilter(
     dPtRelMatchMax = cms.double(1.0),
     genMinPt = cms.double(0.0),
     genMaxAbsEta = cms.double(3.0),
-    keepUnmatchedAll = cms.bool(False),
-    keepEveryNthUnmatched = cms.uint32(0),
+    filter = cms.bool(True),
 )
 
 process.seqALCARECOMuon = cms.Sequence(process.ALCARECOMuon * process.genMatchedTracks)

@@ -34,7 +34,7 @@ process.ALCARECOPion = _ats.AlignmentTrackSelector.clone(
 
 # ------- loose gen-match FILTER (dR<=0.3, unmatched tracks+events dropped) -------
 process.genMatchedTracks = cms.EDFilter(
-    "GenMatchedTrackFilter",
+    "GenMatchedTrackSelectorModule",
     src = cms.InputTag("ALCARECOPion"),
     genParticles = cms.InputTag("genParticles"),
     dRMatchMax = cms.double(0.3),
@@ -63,7 +63,6 @@ process.ALCARECOStreamPion = cms.OutputModule(
         "drop recoTracks_ALCARECOPion_*_*",
         "drop recoTracks_generalTracks_*_*",
         "keep *_genMatchedTracks_*_*",
-        "keep *_ALCARECOPion_*_*",
         "keep *_genParticles_*_*",
         "keep SimTracks_g4SimHits_*_*",
         "keep SimVertexs_g4SimHits_*_*",

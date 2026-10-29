@@ -3,7 +3,7 @@
 # Policy (2026-10-16): no HLT/DCS prefilters, NO track cuts (passthrough).
 # Keeps the gen-matched tracks with their extras/hits/clusters, the MC truth
 # needed for the gen and sim-hit association of the track refit (genParticles,
-# generator, pileup, SimTracks/SimVertices, tracker PSimHits) and the muons
+# generator, slimmed pileup, SimTracks/SimVertices, tracker PSimHits) and the muons
 # linked to the gen-matched tracks.
 import FWCore.ParameterSet.Config as cms
 
@@ -61,7 +61,13 @@ process.genMatchedMuons = AlCaRecoMuonRelinker.clone(
     selectedTracks = "genMatchedTracks",
 )
 
-process.seqALCARECOKaon = cms.Sequence(process.ALCARECOKaon * process.genMatchedTracks * process.genMatchedMuons)
+# ------- pileup summary slimmed as in MiniAOD (the full PileupSummaryInfos are
+# ~3.7 kB/event each under premixing, and there are two copies: addPileupInfo
+# and mixData) -------
+from PhysicsTools.PatAlgos.slimming.slimmedAddPileupInfo_cfi import slimmedAddPileupInfo
+process.slimmedAddPileupInfo = slimmedAddPileupInfo.clone()
+
+process.seqALCARECOKaon = cms.Sequence(process.ALCARECOKaon * process.genMatchedTracks * process.genMatchedMuons * process.slimmedAddPileupInfo)
 process.pathALCARECOKaon = cms.Path(process.seqALCARECOKaon)
 
 # --------------------------- output -----------------------------
@@ -84,7 +90,7 @@ process.ALCARECOStreamKaon = cms.OutputModule(
         "keep GenLumiInfoHeader_generator_*_*",
         "keep GenLumiInfoProduct_generator_*_*",
         "keep GenEventInfoProduct_generator_*_*",
-        "keep PileupSummaryInfos_*_*_*",
+        "keep *_slimmedAddPileupInfo_*_*",
         "keep int_*_bunchSpacing_*",
         "keep SimTracks_g4SimHits_*_*",
         "keep SimVertexs_g4SimHits_*_*",
